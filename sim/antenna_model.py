@@ -361,7 +361,17 @@ class Simulation:
         self.loss_start_ms = None
         self.relocks = []  # (loss confirmed, lock confirmed), simulation milliseconds
         self.state_paths = {key: deque(maxlen=8) for key in ("phase", "air", "ground")}
+        self.clear_tracking_stats()
         self.step()
+        self.clear_tracking_stats()  # The initial control tick prepares the display.
+
+    def clear_tracking_stats(self):
+        self.tracking_stats_start_ms = self.ms
+        self.effective_tracking_ticks = 0
+
+    @property
+    def tracking_stats_seconds(self):
+        return self.effective_tracking_ticks * DT, (self.ms - self.tracking_stats_start_ms) / 1000
 
     def close(self):
         if self.handle:
@@ -456,16 +466,18 @@ class Simulation:
         self.lib.control_step(self.handle, self.ms, self.air, self.ground, readings,
                               self.level, self.detected, self.nominal, self.realign_pending, self.out)
         self.realign_pending = False
+        effective_tracking = self.out.phase == MODES.index("TRACK") and self.aligned_lock
+        self.effective_tracking_ticks += int(effective_tracking)
         for run in runs:
             if not run.waiting:
-                run.track_ticks+=int(self.out.phase==MODES.index("TRACK") and self.aligned_lock)
+                run.track_ticks+=int(effective_tracking)
                 run.near_returns+=int(self.out.phase==MODES.index("NEAR") and self.out.phase!=prev.phase)
                 run.losses+=int(bool(prev.holding) and not self.out.holding)
         # Timing follows controller loss declarations, including loss during a
         # periodic calibration. Only a verified return to TRACK closes an outage.
         if self.first_lock_ms is not None and not self.out.holding and self.loss_start_ms is None:
             self.loss_start_ms = self.ms
-        if self.out.phase == MODES.index("TRACK") and self.aligned_lock:
+        if effective_tracking:
             if self.first_lock_ms is None:
                 self.first_lock_ms = self.ms
             elif self.loss_start_ms is not None:

@@ -202,6 +202,11 @@ class Workbench:
         self.mute = tk.BooleanVar(value=False)
         ttk.Checkbutton(controls,text="遮挡信标",variable=self.mute,
                         command=self.toggle_beacon).pack(side="left")
+        tracking_bar = ttk.Frame(right)
+        tracking_bar.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Button(tracking_bar, text="清空统计", command=self.clear_tracking_stats).pack(side="right")
+        self.tracking_status = ttk.Label(tracking_bar)
+        self.tracking_status.pack(side="left", fill="x", expand=True)
         flight_bar=ttk.Frame(right)
         flight_bar.pack(fill="x",padx=8)
         ttk.Button(flight_bar,text="连续飞行测试",command=self.configure_flight).pack(side="left")
@@ -342,6 +347,10 @@ class Workbench:
         self.credit = 0
         self.last_wall = time.perf_counter()
         self.fit()
+        self.refresh()
+
+    def clear_tracking_stats(self):
+        self.sim.clear_tracking_stats()
         self.refresh()
 
     def stop_flight(self, ground=False):
@@ -683,6 +692,10 @@ class Workbench:
     def refresh(self):
         s=self.sim
         o=s.out
+        effective, elapsed = s.tracking_stats_seconds
+        percentage = f"{effective / elapsed:.2%}" if elapsed else "—"
+        self.tracking_status.configure(
+            text=f"有效跟踪占比 {percentage}　有效 {effective:.2f} s / 总计 {elapsed:.2f} s")
         flight=s.flight
         self.stop_flight_btn.configure(state="normal" if flight and flight.active else "disabled")
         summary=""

@@ -56,6 +56,24 @@ class LockRecoveryTest(unittest.TestCase):
         self.assertEqual(tuple(s.state_paths["phase"]), path)
         self.assertTrue(s.aligned_lock)
 
+    def test_tracking_stats_include_acquisition_and_restart_from_current_state(self):
+        s = self.sim
+        self.assertEqual(s.tracking_stats_seconds, (0, 0))
+        self.advance(100)
+        self.assertEqual(s.tracking_stats_seconds, (0, 1))
+        self.wait_for(lambda: s.first_lock_ms is not None, 30)
+        self.assertGreater(s.tracking_stats_seconds[0], 0)
+        clock_before_clear = s.ms
+        output_before_clear = bytes(s.out)
+        s.clear_tracking_stats()
+        self.assertEqual(s.tracking_stats_seconds, (0, 0))
+        self.assertEqual((s.ms, bytes(s.out)), (clock_before_clear, output_before_clear))
+        self.advance(100)
+        self.assertEqual(s.tracking_stats_seconds, (1, 1))
+        s.blocked = True
+        self.advance(100)
+        self.assertEqual(s.tracking_stats_seconds, (1, 2))
+
     def test_continuous_transverse_motion_without_reacquisition(self):
         s=self.sim
         s.flight=f=FlightTest(10,10,90,15,42,True)
