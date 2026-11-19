@@ -1,0 +1,25 @@
+# This repository contains the pointing algorithms, host simulation and their documentation.
+/*
+!/.gitignore
+!/README.md
+!/common/
+!/airborne/
+!/vehicle/
+!/sim/
+!/docs/
+
+/RadarSimulatorTable1_407_*/
+/docs/*
+!/docs/*.md
+!/docs/*.svg
+!/docs/tracking-guide/
+/docs/tracking-guide/*
+!/docs/tracking-guide/dist/
+
+__pycache__/
+*.py[cod]
+*.exe
+*.dll
+*.so
+*.o
+*.csv
