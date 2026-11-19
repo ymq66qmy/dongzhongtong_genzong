@@ -38,6 +38,7 @@ typedef struct {
 API Control *control_new(void) {
     Control *c=calloc(1,sizeof(*c));
     if (!c) return NULL;
+    airborne_track_init(&c->history);
     vehicle_init(&c->scanner);
     c->scanner.cfg.fast_relock=true;
     c->scanner.cfg.fast_acquire=true;
@@ -120,6 +121,7 @@ API void control_step(Control *c, uint32_t now, const Pose *air, const Pose *gro
     Vehicle *v=&c->scanner;
     Mode before=v->mode;
     int old_point=v->point;
+    bool old_probe_el_first=v->probe_el_first;
     bool confirming=v->confirm_lock;
     bool monitoring_weak=v->monitoring_lock && v->weak_stream;
     bool retry_center=v->retry_center;
@@ -129,7 +131,7 @@ API void control_step(Control *c, uint32_t now, const Pose *air, const Pose *gro
     out->ground=target(vehicle_step(v,now,&c->ground));
     if (before!=TRACK || v->mode!=TRACK) {
         c->track_center=c->track_best=-121;
-    } else if (old_point==4 && v->point==0) {
+    } else if (old_point==4 && v->point==0 && old_probe_el_first==v->probe_el_first) {
         c->track_center=c->track_best=v->cross_score[0];
         for (int i=1;i<5;++i) {
             if (v->cross_score[i]<=-121) { c->track_best=-121; break; }
@@ -164,6 +166,7 @@ API void control_step(Control *c, uint32_t now, const Pose *air, const Pose *gro
         out->reason=confirming ? 4 : (v->air_rounds>=v->cfg.air_max_rounds ? 7 : 5);
     if (before==REFINE && v->mode==CAL_AIR && v->confirm_lock) out->reason=8;
     if (before==REFINE && v->mode==CAL_AIR && !v->confirm_lock) out->reason=11;
+    if (before==CAL_AIR && confirming && v->mode==REFINE) out->reason=18;
     if (before==TRACK && v->mode==CAL_AIR && !v->cfg.air_recheck_ms) out->reason=17;
     if (before==RECOVER && v->mode==NEAR) out->reason=12;
     if (before==CAL_AIR && v->mode==RECOVER && !monitoring_weak && c->ground.beacon_present)

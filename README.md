@@ -6,35 +6,164 @@
 
 ## STM32 接入
 
-* 机端编译 `common/link.c` 与 `airborne/airborne.c`，车端编译 `common/link.c` 与 `vehicle/vehicle.c`，使用 C99 和数学库。两端每 10 ms 运行一次控制任务。建议使用指定成员初始化外设输入结构。
-* 机端在控制任务内持有零初始化的 `AirHistory`；调用 `airborne_track_step(&history, now, &air, &reply)` 才会自动从定位历史补偿运动。无历史的 `airborne_point_step` 保留给静态几何对照。位置报文只有经纬高、测量时刻和有效位，速度由机内推算。只有航向时，俯仰和横滚置零，角速率有效位置 false。
-* 车端启动时初始化一次 `Vehicle`；每拍调用 `vehicle_step(&scanner, now, &ground)`。首次粗方位采用 `rough_heading_deg, heading_ms, heading_valid`；无可用航向时从当前编码器角附近开始。两端都填本机编码器、状态和测量时刻。使能由设备工作状态决定，请勿用离地高度或飞控解锁标志触发 `vehicle_init`。
-* 方位是各端自身云台的单圈绝对角 [0°,360°)，跨零取最短角差。两端编码器反馈和目标俯仰角均为 0°～90°。0° 时天线面竖直、波束水平；机端读数向下增加，90° 时正对下方；车端读数向上增加，90° 时正对上方。标准安装的 `el_zero_deg` 为 0、`reverse_el` 为 false。机端的姿态变换在输出前完成，LoRa 的 `el_trim` 仍是在地理仰角上叠加的有符号修正。越过机械行程的目标限幅，越界的编码器反馈进入 WAIT_DATA。
-* 安装标定时，将基座朝前且波束水平时的编码器读数写入 `GimbalFrame`，按实际编码器方向设置反向位。`Command.valid=false` 时忽略占位角。
-* 经纬度用 WGS‑84 十进制度，两端高度需统一基准。GGA 度分字段用 `gga_degrees(raw, hemisphere, &deg)` 转换，例如 3430.000,N 为 34.5°。现有车载工程的一条解析路径直接除以 100，接入时应核对数据来源。GGA 海拔加上带符号的大地水准面分离值后为椭球高。
-* 每秒一轮 LoRa 双向通信。车发本机位置、状态和 `Vehicle.request`，机发本机位置、状态和 `AirReply`。按字段编解码；用会话号、传输序号和时间戳拒绝重复/乱序帧。定位的时间戳是测量时刻折算到本地单调时钟，协调帧使用本地接收时刻。应用层原子传递完整输入快照。硬件适配层实现实际收发和伺服驱动。
+每块板只运行本端算法：**上电初始化一次，每 10 ms 提交一次完整输入快照，取回本端云台的目标方位、目标俯仰和输出状态。** 两端另有一对 LoRa 请求与回执，用来协调“机端到位后，车端才采样”。开始追踪后，起飞、降落、车辆移动和普通失锁都继续调用同一个周期函数。
 
-接收机若提供信标存在位，在 `VehicleInput` 逐帧设置 `has_beacon_flag=true`、`beacon_present` 和有效 RSSI。仅有强度时按实测噪底设置 `detect_level`。`acquire_level` 只作峰值质量门限及跟踪阶段复校判据。`near_step_deg` 是 5×5 峰值复核网格的间距。
+| 板端 | 加入固件工程的源文件（C99，链接数学库） | 上电调用一次 | 每 10 ms 调用 |
+|---|---|---|---|
+| 机载 STM32 | `common/link.c`、`airborne/airborne.c` | `airborne_track_init(&history)` | `cmd = airborne_track_step(&history, now, &input, &reply)` |
+| 车载 STM32 | `common/link.c`、`vehicle/vehicle.c` | `vehicle_init(&scanner)` | `cmd = vehicle_step(&scanner, now, &input)` |
 
-## 调参
+### 1. 调用前准备
+
+1. 每块板各自保存一个长期存在的上下文，机端用 `AirHistory`，车端用 `Vehicle`。下面示例使用文件内的 `static` 对象，由控制任务独占。初始化后由算法维护其内容。
+2. 标定安装零点和编码器方向。标准安装下，基座向前、天线面竖直、波束水平时，方位和俯仰均为 0°。方位向右转增加，反馈及输出按单圈 [0°, 360°) 表示；俯仰范围均为 [0°, 90°]，机端向下增加，车端向上增加。若设备有安装偏置或反向，填写下表的 `frame`。
+3. 两板分别用本机的 `uint32_t` 单调毫秒时钟作为 `now`，例如配置为 1 ms 时基的 `HAL_GetTick()`。定位、姿态、编码器、信标各自更新缓存及其**实际测量时间**；LoRa 收到新帧时更新对端缓存。控制任务每 10 ms 原子地复制这些缓存。只有新样本才更新对应时间戳，同一定位或 LoRa 帧允许被连续多拍读取。
+4. 开机先将输入结构零初始化。按外设真实状态给有效位置真；车端另需分配本次启动的非零 `session`。尚未收到对端状态时，可在快照中令 `peer_status_ms = now - (NAV_MAX_AGE_MS + 1u)` 来表达超时；直接填 0 在刚上电时可能被当作新鲜状态。
+5. 两端位置使用 WGS‑84 十进制度、同一高度基准（推荐椭球高，米）。例如 GGA 的 `3430.000,N` 为 34.5°，可用 `gga_degrees(raw, hemisphere, &deg)` 转换。若 GGA 输出海拔，则加上带符号的大地水准面分离值后得到椭球高。现有车载工程有路径直接除以 100，接入时需核对定位格式。
+
+### 2. 两端怎么调用
+
+以下是两个独立固件的调用示例。`board_*` 是需要对接到板级驱动的函数声明。快照函数填满第 3 节所列输入；发布函数按值复制请求或回执供 1 秒 LoRa 任务取用。控制周期与无线发送周期独立。
+
+**机端** · `airborne_track_init` 清空定位历史。每拍传入历史对象、当前时刻、只读 `AirInput` 和可写 `AirReply`；四个参数中的指针都要指向有效对象。位置速度可由连续定位推算。
 
 ```c
-Vehicle scanner;
-VehicleConfig cfg = vehicle_defaults;
-cfg.near_step_deg = 4;
-cfg.sweep_step_deg = 10;
-cfg.detect_level = -116;   /* RSSI-only detection fallback */
-cfg.acquire_level = -88;   /* final lock qualification */
-cfg.release_level = -96;
-cfg.refine_start_deg = 4;
-cfg.refine_min_deg = 1;
-cfg.refine_factor = 0.5;
-cfg.refine_max_rounds = 12;
-vehicle_init(&scanner);
-bool applied = vehicle_configure(&scanner, &cfg);
+#include "airborne/airborne.h"
+
+static AirHistory history;
+extern void board_air_snapshot(AirInput *out);
+extern void board_air_publish_reply(AirReply reply);
+extern void board_air_servo_target(double az_deg, double el_deg);
+
+void air_app_init(void)
+{
+    airborne_track_init(&history);
+}
+
+Command air_app_tick_10ms(uint32_t now)
+{
+    AirInput input = {0};
+    AirReply reply;
+    board_air_snapshot(&input);
+    Command cmd = airborne_track_step(&history, now, &input, &reply);
+    board_air_publish_reply(reply);
+    if (cmd.valid)
+        board_air_servo_target(cmd.az_deg, cmd.el_deg);
+    return cmd;
+}
 ```
 
-配置仅在启动或整组参数确有变化时应用。有效配置从 NEAR 重新开始；起飞时沿用原来的配置、中心和阶段。每个参数的用途见详细手册。
+**车端** · `vehicle_init` 加载固件默认参数并准备几何对准。每拍传入控制器对象、当前时刻和只读 `VehicleInput`。调用结束后，读 `scanner.request` 作为下次发给机端的修正请求。
+
+```c
+#include "vehicle/vehicle.h"
+
+static Vehicle scanner;
+extern void board_vehicle_snapshot(VehicleInput *out);
+extern void board_vehicle_publish_request(AirRequest request);
+extern void board_vehicle_servo_target(double az_deg, double el_deg);
+
+void vehicle_app_init(void)
+{
+    vehicle_init(&scanner);
+}
+
+Command vehicle_app_tick_10ms(uint32_t now)
+{
+    VehicleInput input = {0};
+    board_vehicle_snapshot(&input);
+    Command cmd = vehicle_step(&scanner, now, &input);
+    board_vehicle_publish_request(scanner.request);
+    if (cmd.valid)
+        board_vehicle_servo_target(cmd.az_deg, cmd.el_deg);
+    return cmd;
+}
+```
+
+`cmd.valid == false` 时，示例停止下发新目标。伺服保持、停机、故障保护由板级逻辑按设备状态执行。方位跨 0° 时，伺服按最短角差执行，例如从 359° 到 1° 只需正转 2°。
+
+### 3. 每拍输入的结构体和字段
+
+**两端共有的 `input.link`（`LinkInput`）**。其中 `local` 始终是本机，`peer` 始终是另一端。机端需要两端位置持续做运动补偿；车端在几何对准和圆周搜索时使用位置，捕获后的双轴修正依据本机信标。
+
+| 字段 | 板级应填内容 |
+|---|---|
+| `local`、`peer`（`Fix`） | `lat_deg` 纬度 −90～90°，北为正；`lon_deg` 经度 −180～180°，东为正；`height_m` 高度；`valid` 定位有效；`stamp_ms` 定位测量时刻。对端测量时刻先折算到本机时钟。几何指向要求两端定位各不超过 2500 ms，且斜距至少 1 m。 |
+| `enabled`、`local_ok` | 分别为本机工作使能、本机设备健康。地面满足工作条件即可使能。 |
+| `peer_ok`、`peer_status_ms` | 最近一份对端状态报文中的健康位，以及该新报文在本机的接收时刻。状态超过 2500 ms 进入等待。 |
+| `actual`（`GimbalAngles`） | 本机编码器实际 `az_deg`、`el_deg`，测量时刻 `stamp_ms`，反馈有效位 `valid`。最大允许年龄 100 ms；俯仰越界会使目标无效。 |
+| `frame`（`GimbalFrame`） | `az_zero_deg`、`el_zero_deg` 为波束朝前且水平时的编码器读数；`reverse_az`、`reverse_el` 表示该轴编码器递增方向与约定相反。标准安装四项均为 0。 |
+| `lead_ms` | 机端额外补偿的实测指令/执行延迟，单位 ms。未知填 0，表示预测到当前时刻；样本年龄加提前量最多按 1200 ms 外推。车端填 0。 |
+
+**机端特有字段（`AirInput`）**
+
+| 字段 | 板级应填内容 |
+|---|---|
+| `true_heading_deg`、`heading_ms`、`heading_valid` | 天线基座的真航向，正北 0°、正东 90°，含安装偏航修正；姿态测量时刻及有效位。航向无效或超过 2500 ms 时返回 `WAIT_DATA`。 |
+| `pitch_deg`、`roll_deg` | 基座俯仰和横滚，单位度，抬头为正、右侧下沉为正。只有航向时两者填 0，此时采用水平基座假设。 |
+| `rates_valid`、`heading_rate`、`pitch_rate`、`roll_rate` | 可选的航向、俯仰、横滚**欧拉角变化率**，单位 °/s。无这些量时填 `false, 0, 0, 0`。 |
+| `request`、`request_rx_ms` | 车端上次发来的 `AirRequest` 和该新帧在机端的接收时刻。无有效请求时仍可按几何方向指向，此时回执的会话号为 0。 |
+
+**车端特有字段（`VehicleInput`）**
+
+| 字段 | 板级应填内容 |
+|---|---|
+| `session` | 本次车端运行的非零会话号，每 10 ms 保持同值。重新启动时使用新号，使上次运行的回执失效。 |
+| `rough_heading_deg`、`heading_ms`、`heading_valid` | 可选的车端基座粗略真航向（度）、测量时刻及有效位，仅在几何初指时用。**本车航向偏差大就填 `heading_valid=false`**，算法从当前编码器方位开始尝试，位置仍提供几何仰角。 |
+| `rssi`、`rssi_valid`、`sample_ms` | 每 10 ms 一帧的接收强度 [−120, 0]、该数值是否可用、该次信标测量在本机的有效时刻（扣除已知接收机延迟）。到位采样只接受时间戳前进且年龄 ≤30 ms 的样本。门限用与接收机一致的刻度。 |
+| `has_beacon_flag`、`beacon_present` | 接收机提供检出位时分别填 `true` 和**本帧**检出结果，同时提供有效强度；只有 RSSI 时填 `has_beacon_flag=false`，由 `detect_level` 判定检出。接收机没有送来新帧时保留原采样时间。 |
+| `air`、`air_rx_ms` | 上次收到的机端 `AirReply` 和该帧在车端的接收时刻；会话号、请求点号匹配且回执新鲜时才用其到位位。 |
+| `request_realign` | 常态 `false`，操作者要求立即重新几何对准时置 `true` **一个控制拍**。普通失锁由算法判定。 |
+
+### 4. 返回值、状态和 LoRa 收发
+
+两端周期函数均**按值返回 `Command`**。伺服只需要 `valid`、`az_deg`、`el_deg`。上位机可另外显示 `mode`。
+
+| 输出 | 含义及使用方式 |
+|---|---|
+| `Command.valid` | 本拍有可用的伺服目标时为 `true`。为 `false` 时角度字段是占位值，不向伺服发送。 |
+| `Command.az_deg`、`Command.el_deg` | 本机云台坐标系的**绝对目标角**（度），已包含零点和方向标定。方位 [0°, 360°)，俯仰 [0°, 90°]。直接发给接收绝对角度的伺服。 |
+| `Command.mode` | 本端本拍输出状态。`IDLE` 未使能，`WAIT_DATA` 等待数据，`FAULT` 设备故障，三者目标无效；`POINT` 有效指向或等待机端到位。机端正常指向通常一直输出 `POINT`。 |
+| 车端阶段 | `NEAR` 几何对准，`SWEEP` 圆周搜索，`REFINE` 车端精扫，`VERIFY_PEAK` 宽网格复核，`CAL_AIR` 机端校正或回峰确认，`TRACK` 跟踪采样，`RECOVER` 局部重捕。遥测需要区分“正在执行的扫描阶段”和“本拍在等待”时，有效输出下可额外读 `scanner.mode`；无效时显示 `cmd.mode`。 |
+| 可选锁定遥测 | 车端 `scanner.monitoring_lock` 表示曾确认锁定且目前仍在监视该锁定。它可能跨过复校阶段；单个瞬时 RSSI 和机端的到位位都不能单独证明双端锁定。 |
+
+**每秒一次 LoRa 双向交换**。车→机发送车端位置、健康状态及 `scanner.request`；机→车发送机端位置、健康状态及本拍输出参数 `reply`。快照在两次收包间继续使用；接收新包才更新时间。
+
+| 载荷 | 字段和约定 |
+|---|---|
+| `AirRequest`（车→机） | `session` 为车端会话号，`point` 为算法生成的修正请求标识，原样发送。`az_trim`、`el_trim` 单位度，范围各 ±20°，加在**地理视线**的方位和仰角上；`el_trim` 正值向上。机端再换算为自身云台角。 |
+| `AirReply`（机→车） | `session`、`point` 原样回显机端正在执行的有效请求；`arrived` 表示机端编码器的双轴误差均 ≤0.35°。无有效请求或本机输出无效时回执清零。 |
+| 时间与编码 | 请求和回执的最大年龄均为 2500 ms。无线层按字段编码，用传输序号过滤重复或乱序报文；同一个 `point` 可以出现在多份新的周期报文中。两板的启动时刻可不同，禁止直接相减两板的毫秒计数。 |
+
+### 5. 车端可选调参
+
+使用默认参数时只需 `vehicle_init`。自定义参数可在初始化阶段从 `vehicle_defaults` 复制，再调用一次 `vehicle_configure`。函数返回 `true` 表示整组生效并从 `NEAR` 开始，返回 `false` 表示校验失败，原配置继续有效。只在确实需要改参时调用。
+
+```c
+#include "vehicle/vehicle.h"
+
+bool apply_receiver_config(Vehicle *scanner, double measured_half_power_deg)
+{
+    VehicleConfig cfg = vehicle_defaults;
+    cfg.rx_half_power_deg = measured_half_power_deg;
+    return vehicle_configure(scanner, &cfg);
+}
+```
+
+| `VehicleConfig` 字段 | 固件默认值与含义 |
+|---|---|
+| `detect_level`、`acquire_level`、`release_level` | −116 检出（仅 RSSI 模式）、−88 锁定、−96 保持。取值满足 −120 ≤ 检出 ≤ 保持 < 锁定 ≤ 0，保持须高于 −120。实机按接收机噪底和主瓣强度标定。 |
+| `sweep_step_deg`、`row_step_deg`、`near_step_deg` | 10° 圆周方位步进、6° 搜索俯仰行距、4° 宽网格复核间距。 |
+| `refine_start_deg`、`refine_min_deg`、`refine_factor`、`refine_max_rounds` | 常规精扫从 4° 收到最小 1°；每次收敛乘 0.5；最多 12 轮。 |
+| `probe_deg`、`peak_margin`、`pair_margin`、`rx_half_power_deg` | 小十字探测偏移 1.25°；常规换峰最小改善量 0.45 dB；两侧均分差判据的基准 0.12 dB；接收天线实测**单侧**半功率角默认 0，关闭标定方向图拟合。 |
+| `arrival_tolerance_deg`、`settle_ms`、`sample_count`、`sample_window_ms` | 车端到位容差 0.25°，到位后稳定 40 ms，每点采 5 帧，稳定后的采样窗口上限 110 ms。窗口至少覆盖 `sample_count × 10 ms`。 |
+| `move_timeout_ms` | 单次等待转动的超时时间 4000 ms，用于重新计时或重新请求到位。伺服速度由板级驱动设置。 |
+| `weak_rounds`、`recover_step_deg`、`recover_radius_points` | 连续 2 轮弱信号触发重捕；重捕网格间距 5°，每轴半径 2 个间隔，对应 5×5 个点。 |
+| `air_search_deg`、`air_refine_deg`、`air_min_deg`、`air_max_rounds` | 机端粗搜索偏移 8°；机端校正初始 4°、最小 1°、最多 15 轮。 |
+| `air_recheck_ms`、`fast_acquire`、`fast_relock`、`track_weak_ms` | 周期复校间隔 0（关闭）；快速捕获、快速重锁均默认关闭，依赖已标定的主瓣门限；基于新鲜弱帧提前重捕的持续时间默认 0（按整轮判断）。 |
+| `realign_drop_db`、`realign_weak_ms`、`realign_ack_ms` | 极弱线比保持线低 24 dB，最低取 −120；持续极弱或无信标 250 ms，或连续无匹配回执 6000 ms，可触发几何重对准。对应时长设 0 可关闭该项。 |
+
+字段类型可直接查阅 [公共类型](common/link.h)、[机端接口](airborne/airborne.h) 和 [车端接口](vehicle/vehicle.h)。
 
 ## 鼠标交互仿真
 
@@ -66,13 +195,28 @@ python sim/interactive.py
 
 ## 闭环仿真与复现
 
-**连续飞行测试**。交互窗口可设置最低和最高水平速度、航段时长、随机种子，以及随机航迹或固定航迹角（正北 0°，正东 90°）。默认先完成锁定，再从当前位置等高平移；取消「先锁定」即可测试移动中捕获。各航段之间以最多 10°/s 转向、2 m/s² 改变速度，机头航向独立。相同初始条件、参数和种子可复现。播放暂停冻结测试时钟，「停止飞行」让无人机停在当前位置、继续运行跟踪器，「重置」结束测试并恢复初始场景。
+**长时间移动中的失锁。** 车端在配置实测 `rx_half_power_deg` 和正的 `pair_margin` 后，TRACK 阶段可利用探测点之间转动途中的 RSSI。控制器保留最近 24 组实际编码器与信标读数，两者测量时间相差最多 10 ms，采样间隔至少 40 ms。当信号比已验证的相对峰值下降且仍达到保持线时，用局部主瓣方向图估算哪一轴偏离了峰心。拟合扣除窗口内的线性强度变化，仅在轴向运动足以区分方向时移心，每次每轴最多一个 `probe_deg`，下一轮优先探测另一轴。已经失锁时，若完整车端十字仍找到接近历史峰值的点，会先复测该点和已确认的机端修正；回峰仍未通过但保持线以上有完整样本时，最多再精扫两次，然后按原流程重新校正机端。
+
+使用相同三维轨迹、固定 5°/s 双轴伺服和相同的自动门限作前后对照。每条轨迹运行 1560 秒，使用窗口默认速度、升降、路面和坡道参数，仿真时刻 30 秒开始飞行。双端同时起步的 6 组中，车端转向限速为 0.25°/s 时机端种子取 42、46，1°/s 时取 42、43、44、50。另外两组让车辆延后加入：种子 42 延后 1100 秒（0.25°/s），种子 51 延后 600 秒（1°/s）。车端种子均取机端种子加 31。上位机的飞行和行车栏各自统计运动期间同一条链路的失锁事件，两栏次数有重叠。
+
+| 8 条轨迹的统计量 | 优化前 → 优化后 |
+|---|---|
+| 8 条轨迹累计失锁 | 18 → 7 次 |
+| 有效跟踪时间占比（TRACK、双端在主瓣内、信号达到保持线） | 89.12% → 96.87% |
+| 双端实际同时在主瓣内的时间占比（逐拍用仿真真值独立计算） | 92.81% → 97.46% |
+| 已完成重锁中最长用时 | 176.34 → 81.52 s |
+
+**连续飞行测试**。交互窗口可设置最低和最高水平速度、航段时长、随机种子，以及随机航迹或固定航迹角（正北 0°，正东 90°）。窗口默认先完成锁定，再从当前位置移动，高度以起始海拔为中心按正弦平滑升降（幅值 ±20 m、周期 120 s），幅值设为 0 即等高飞行；取消「先锁定」即可测试移动中捕获。各航段之间以最多 10°/s 转向、2 m/s² 改变速度，机头航向独立。相同初始条件、参数和种子可复现。播放暂停冻结测试时钟，「停止飞行」让无人机停在当前位置、继续运行跟踪器，「重置」结束测试并恢复初始场景。
+
+**自动运动范围**。两个测试窗口均可设置同一个三维斜距上限，默认 3000 m。以开始测试时两站的空间中点为活动中心，每端被限制在半径为上限一半的球内。靠近边界时自动折返，转弯空间不足时减速，每一拍按预测的经纬高检查是否越界。这样即使两端沿相反方向行驶，或同时向同一方向移动，也会留在测试区域内。上限必须大于当前斜距；手工拖动导致两站超限时，自动运动停止并显示原因。可在调整位置或上限后重新启动。
+
+**高度限制**。仿真中机端海拔始终至少比车端高 0.01 m（高度输入的显示精度）。自动飞行下降至下限时停止下降；车辆继续上坡时，正在自动飞行的机端会随坡抬高。如果机端已停止、等待起步，或抬高后会超出运动区域，车辆在坡上等待，条件允许后继续。剖面拖动在高度边界处限幅，侧栏输入不合规时提示修改。状态栏实时显示两端高差。
 
 **车辆连续测试**。可单独运行，也可与飞行测试同时运行。要让双方同时起步，暂停并重置，分别开始两个测试，保留「先锁定，再开始移动」，然后恢复播放。车辆有独立的速度范围、随机种子、路段时长、目标方向和最大转向速度。车头从当前航向渐转并沿车头方向行驶。停车会保留车体所处坡度，无人机和跟踪器仍继续运行。地图用两种颜色绘制轨迹，各测试从自身实际起步时刻开始计数。
 
-车辆沿里程采样同一路段的左右轮迹。可调参数为路面起伏幅值（米，0 表示平路）与基准波长（米）。轮迹包含不同波长的公共起伏及左右高差，依照 2.8 m 轴距、1.6 m 轮距估算四轮平均高度、纵倾和侧倾。模型每 10 ms 将车体姿态与云台编码器角度合成空间波束，计算离轴角、信标强度及两个投影视图。相同路段车速越快，扰动频率越高。正纵倾表示车头抬高，正侧倾表示右侧降低。车体姿态仅供仿真和显示，未输入 STM32 控制器。此模型适合比较跟踪算法，实车悬架响应需要通过实测标定。
+车辆沿里程采样同一路段的左右轮迹。窗口默认叠加幅值 6 m、波长 400 m 的长坡，使海拔随行驶距离升降，纵倾随前后轮所在坡度改变。停车时里程和高度都保持，可独立调节长坡与短波颠簸。可调参数为路面起伏幅值（米，0 表示平路）与基准波长（米）。轮迹包含不同波长的公共起伏及左右高差，依照 2.8 m 轴距、1.6 m 轮距估算四轮平均高度、纵倾和侧倾。模型每 10 ms 将车体姿态与云台编码器角度合成空间波束，计算离轴角、信标强度及两个投影视图。相同路段车速越快，扰动频率越高。正纵倾表示车头抬高，正侧倾表示右侧降低。车体姿态仅供仿真和显示，未输入 STM32 控制器。此模型适合比较跟踪算法，实车悬架响应需要通过实测标定。
 
-双端回归场景使用初始默认位置、双轴限速 5°/s、每段 15 秒。无人机为 2～3 m/s、种子 42，车辆为 2～4 m/s、种子 73，双方随机选方向，统计首次锁定后 90 秒。路面幅值 0.08 m、波长 12 m，车体转向上限 0.25°/s 时有效跟踪 90.00 秒，提高到 1°/s 后为 87.89 秒，均无控制器失锁。保持 1°/s，将机端种子依次设为 42～51、车辆种子取机端种子加 31，十组累计有效跟踪占比从旧版的 51.95% 提升到 96.67%，失锁从 9 次降到 1 次。有效跟踪逐拍检查 TRACK、双端主瓣和保持强度，控制器失锁还需满足相应跳转条件。
+下列历史跟踪性能对照固定无人机高度，并将长坡幅值设为 0，以单独考察短波颠簸。双端回归场景使用初始默认位置、双轴限速 5°/s、每段 15 秒。无人机为 2～3 m/s、种子 42，车辆为 2～4 m/s、种子 73，双方随机选方向，统计首次锁定后 90 秒。路面幅值 0.08 m、波长 12 m，车体转向上限 0.25°/s 时有效跟踪 90.00 秒，提高到 1°/s 后为 87.89 秒，均无控制器失锁。保持 1°/s，将机端种子依次设为 42～51、车辆种子取机端种子加 31，十组累计有效跟踪占比从旧版的 51.95% 提升到 96.67%，失锁从 9 次降到 1 次。有效跟踪逐拍检查 TRACK、双端主瓣和保持强度，控制器失锁还需满足相应跳转条件。
 
 接收天线的实测单侧半功率角可填入 `VehicleConfig.rx_half_power_deg`。固件默认 0，交互仿真按模型填 6°。启用后，车端在精扫和 TRACK 中用主瓣内近似二次型的 dB 方向图，将两侧探测点的均分差换算成双轴修正量。方位轴考虑仰角投影，接近天顶时停用该轴拟合。修正有幅度上限，重复同向时追加最多半个已测修正量。已锁过的链路可以先复测先前验证过的机端修正，完整中心窗口的相对强度恢复到历史峰值容差内才通过这条快速复测路径。角速度和车身倾角都未送入车端寻峰器。
 

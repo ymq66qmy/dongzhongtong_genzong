@@ -21,6 +21,7 @@ MODES = ("IDLE", "WAIT_DATA", "FAULT", "POINT", "SWEEP", "REFINE", "TRACK",
 DT = 0.01
 SERVO_SPEED = 5.0
 BEAM_HALF_DEG = 6.0
+MIN_HEIGHT_GAP_M = 0.01  # one increment on the simulator's altitude inputs
 
 
 class Pose(C.Structure):
@@ -170,7 +171,8 @@ def change_reason(previous, current):
                14:f"连续 {current.severe_ms} ms 信标缺失或强度 ≤ {current.severe:.1f}，重新几何对准",
                15:f"连续 {current.ack_timeout_ms/1000:g} s 未匹配到当前点的机端回执，重新几何对准",
                16:"收到重新对准请求，按最新位置重新互指",
-               17:"车端连续两轮峰心强度低于已验证峰值，复测机端方向"}
+               17:"车端连续两轮峰心强度低于已验证峰值，复测机端方向",
+               18:"回峰复测未恢复到历史峰值，信标仍达到保持线，重新精扫车端"}
     if current.reason in special:
         return special[current.reason]
     if a != b:
@@ -189,7 +191,7 @@ def change_reason(previous, current):
 
 class FlightTest:
     """Generate physical positions on the simulation clock. No velocity enters the controllers."""
-    def __init__(self, low, high, course, interval, seed, wait_lock):
+    def __init__(self, low, high, course, interval, seed, wait_lock, altitude_span=0, altitude_period=120):
         if not (0<=low<=high<=200 and 0.1<=interval<=3600 and
                 (course is None or math.isfinite(course))):
             raise ValueError("速度范围 0～200 m/s，最小值须小于等于最大值，航段为 0.1～3600 s。")
@@ -201,6 +203,13 @@ class FlightTest:
         self.ticks=self.track_ticks=self.losses=self.near_returns=0
         self.speed=self.course=0.0
         self.trail=deque(maxlen=600)
+        if not (0<=altitude_span<=1000 and 1<=altitude_period<=7200):
+            raise ValueError("飞行高度幅值为 0～1000 m，升降周期为 1～7200 s。")
+        self.altitude_span, self.altitude_period = altitude_span, altitude_period
+        self.start_height = None
+        self.returning = False
+        self.actual_speed = 0.0
+        self.stop_reason = ""
 
     def platform(self, sim):
         return sim.air
@@ -211,26 +220,55 @@ class FlightTest:
     def turn_rate(self):
         return 10.0
 
+    def next_height(self, p, travel):
+        phase = math.tau*(self.ticks+1)*DT/self.altitude_period
+        desired = self.start_height+self.altitude_span*math.sin(phase)
+        max_step = self.altitude_span*math.tau*DT/self.altitude_period
+        return p.height+max(-max_step,min(max_step,desired-p.height))
+
+    def arrived(self, sim, p, travel):
+        pass
+
     def move(self, sim):
         if self.waiting:
             self.waiting=not sim.aligned_lock or MODES[sim.out.phase]!="TRACK"
             if self.waiting:return
         p=self.platform(sim)
+        if self.start_height is None:
+            self.start_height=p.height
         if self.ticks%self.segment_ticks==0:
             self.target_course=self.rng.uniform(0,360) if self.fixed_course is None else self.fixed_course%360
             self.target_speed=self.rng.uniform(self.low,self.high)
             if self.ticks==0:
                 self.course,self.speed=self.initial_course(p),self.target_speed
+        pos=ecef(p)
+        toward=tuple(c-a for c,a in zip(sim.motion_center,pos))
+        radius=sim.max_slant/2
+        radial=math.hypot(*toward)
+        if radial>0.82*radius:
+            self.returning=True
+        elif radial<0.58*radius:
+            self.returning=False
+        desired_course=view(p,toward)[0] if self.returning else self.target_course
         turn=self.turn_rate()*DT
-        self.course=(self.course+max(-turn,min(turn,wrap_diff(self.target_course-self.course))))%360
+        self.course=(self.course+max(-turn,min(turn,wrap_diff(desired_course-self.course))))%360
         self.speed+=max(-2*DT,min(2*DT,self.target_speed-self.speed))
         lat,brg=map(math.radians,(p.lat,self.course))
-        arc=self.speed*DT/6371000
+        travel=self.speed*DT
+        if self.returning and abs(wrap_diff(desired_course-self.course))>60:
+            # Leave room for a finite-rate turn even for a fast vehicle with slow steering.
+            travel=min(travel,max(0.05, (radius-radial)*math.radians(self.turn_rate())*0.7)*DT)
+        arc=travel/6371000
         sinlat=math.sin(lat)*math.cos(arc)+math.cos(lat)*math.sin(arc)*math.cos(brg)
         newlat=math.asin(max(-1,min(1,sinlat)))
         dlon=math.atan2(math.sin(brg)*math.sin(arc)*math.cos(lat),math.cos(arc)-math.sin(lat)*sinlat)
         if self.ticks%50==0:self.trail.append(Pose(p.lat,p.lon,p.height,p.heading))
-        p.lat,p.lon=math.degrees(newlat),wrap_diff(p.lon+math.degrees(dlon))
+        candidate=Pose(math.degrees(newlat),wrap_diff(p.lon+math.degrees(dlon)),
+                       self.next_height(p,travel),p.heading)
+        if not sim.apply_motion(p,candidate):
+            travel=0.0
+        self.actual_speed=travel/DT
+        self.arrived(sim,p,travel)
         self.ticks+=1
 
 
@@ -239,11 +277,15 @@ class DriveTest(FlightTest):
     WHEELBASE = 2.8
     TRACK_WIDTH = 1.6
 
-    def __init__(self, low, high, course, interval, seed, wait_lock, yaw_rate, amplitude, wavelength):
+    def __init__(self, low, high, course, interval, seed, wait_lock, yaw_rate, amplitude, wavelength,
+                 hill_span=0, hill_wavelength=400):
         super().__init__(low, high, course, interval, seed, wait_lock)
         if not (0 < yaw_rate <= 90 and 0 <= amplitude <= 2 and 1 <= wavelength <= 500):
             raise ValueError("转向限速须在 (0, 90] °/s，路面幅值 0～2 m，波长 1～500 m。")
         self.yaw_rate, self.amplitude, self.wavelength = yaw_rate, amplitude, wavelength
+        if not (0<=hill_span<=100 and 20<=hill_wavelength<=10000):
+            raise ValueError("地形高度幅值为 0～100 m，坡道波长为 20～10000 m。")
+        self.hill_span,self.hill_wavelength=hill_span,hill_wavelength
         self.distance = 0.0
         self.heave = 0.0
         self.start_pitch = self.start_roll = None
@@ -258,7 +300,8 @@ class DriveTest(FlightTest):
             a,b,c = self.phases
             common = .58*math.sin(phase+a) + .20*math.sin(2.3*phase+b)
             cross = .22*math.sin(1.7*phase+c)
-            return self.amplitude*common, self.amplitude*cross
+            hill=self.hill_span*math.sin(math.tau*s/self.hill_wavelength)
+            return hill+self.amplitude*common, self.amplitude*cross
         front, front_cross = axle(distance+self.WHEELBASE/2)
         rear, rear_cross = axle(distance-self.WHEELBASE/2)
         return ((front+rear)/2, math.degrees(math.atan2(front-rear, self.WHEELBASE)),
@@ -273,24 +316,26 @@ class DriveTest(FlightTest):
     def turn_rate(self):
         return min(self.yaw_rate, math.degrees(self.speed/5.0))  # minimum turn radius 5 m
 
-    def move(self, sim):
-        prior = self.ticks
-        super().move(sim)
-        if self.ticks == prior or self.speed == 0:
-            return
-        ground, axes = sim.ground, sim.axes[1]
+    def next_height(self,p,travel):
+        distance=self.distance+travel
+        self.next_road=self.road_pose(distance)
+        blend=min(1.0,distance/self.WHEELBASE)
+        return p.height+(self.next_road[0]-self.initial_height)*blend-self.heave
+
+    def arrived(self,sim,p,travel):
+        p.heading=self.course
+        if travel==0:return
+        axes=sim.axes[1]
         if self.start_pitch is None:
             self.start_pitch, self.start_roll = axes.body_pitch, axes.body_roll
-        self.distance += self.speed*DT
-        height, pitch, roll = self.road_pose(self.distance)
+        self.distance += travel
+        height, pitch, roll = self.next_road
         # Enter the selected road from the current chassis attitude.
         blend = min(1.0, self.distance/self.WHEELBASE)
         heave = (height-self.initial_height)*blend
-        ground.height += heave-self.heave
         self.heave = heave
         axes.body_pitch = self.start_pitch+(pitch-self.start_pitch)*blend
         axes.body_roll = self.start_roll+(roll-self.start_roll)*blend
-        ground.heading = self.course
 
 
 class Simulation:
@@ -310,6 +355,8 @@ class Simulation:
         self.events = []
         self.flight = None
         self.drive = None
+        self.max_slant = 3000.0
+        self.motion_center = None
         self.first_lock_ms = None
         self.loss_start_ms = None
         self.relocks = []  # (loss confirmed, lock confirmed), simulation milliseconds
@@ -320,6 +367,38 @@ class Simulation:
         if self.handle:
             self.lib.control_free(self.handle)
             self.handle = None
+
+    def bounded_height(self, platform, height):
+        if platform is self.air:
+            return max(height,self.ground.height+MIN_HEIGHT_GAP_M)
+        return min(height,self.air.height-MIN_HEIGHT_GAP_M)
+
+    def apply_motion(self, platform, candidate):
+        radius=self.max_slant/2
+        if platform is self.air:
+            candidate.height=self.bounded_height(platform,candidate.height)
+        if math.dist(ecef(candidate),self.motion_center)>radius:
+            return False
+        if platform is self.ground and self.air.height<candidate.height+MIN_HEIGHT_GAP_M:
+            # Follow a rising road only when automatic flight is actually running.
+            # Otherwise hold the car at the grade; never flatten the road profile.
+            if not self.flight or not self.flight.active or self.flight.waiting:
+                return False
+            raised=Pose(self.air.lat,self.air.lon,candidate.height+MIN_HEIGHT_GAP_M,self.air.heading)
+            if math.dist(ecef(raised),self.motion_center)>radius:
+                return False
+            self.air.height=raised.height
+        platform.lat,platform.lon,platform.height=candidate.lat,candidate.lon,candidate.height
+        return True
+
+    def reset_motion_area(self,limit):
+        if self.air.height < self.ground.height+MIN_HEIGHT_GAP_M:
+            raise ValueError(f"机端海拔至少要比车端高 {MIN_HEIGHT_GAP_M:g} m。")
+        a,g=ecef(self.air),ecef(self.ground)
+        if not math.isfinite(limit) or limit<=0 or math.dist(a,g)>=limit:
+            raise ValueError(f"斜距上限必须大于目前两站斜距 {math.dist(a,g):.1f} m。")
+        self.max_slant=limit
+        self.motion_center=tuple((x+y)/2 for x,y in zip(a,g))
 
     def set_thresholds(self, levels):
         """None selects the range budget; fixed levels are detect, severe, hold, lock."""
@@ -355,6 +434,18 @@ class Simulation:
     def step(self):
         prev = self.out
         runs = [r for r in (self.flight, self.drive) if r and r.active]
+        if runs and (self.motion_center is None or any(
+                math.dist(ecef(p),self.motion_center)>self.max_slant/2 for p in (self.air,self.ground))):
+            # Manual drags can relocate either station outside the automatic test area.
+            try:
+                self.reset_motion_area(self.max_slant)
+            except ValueError as exc:
+                for run in runs:
+                    run.active=False
+                    run.stop_reason=str(exc)
+                runs=[]
+        if not runs:
+            self.motion_center=None
         for run in runs:
             run.move(self)
         for axis, target in zip(self.axes, (prev.air, prev.ground)):

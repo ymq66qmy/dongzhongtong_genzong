@@ -5,7 +5,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from antenna_model import BEAM_HALF_DEG, DT, DriveTest, FlightTest, MODES, Simulation, beam_direction, wrap_diff
+from antenna_model import BEAM_HALF_DEG, DT, DriveTest, FlightTest, MIN_HEIGHT_GAP_M, MODES, Simulation, beam_direction, wrap_diff
 
 INK, MUTED, LINE = "#183538", "#4d6869", "#c8d8d3"
 AIR, GROUND = "#b65521", "#147b74"
@@ -123,10 +123,10 @@ class Workbench:
         self.event_key = None
         self.speed_dialog = None
         self.threshold_dialog = None
-        self.flight_options=("2","3","15","42","90")
+        self.flight_options=("2","3","15","42","90","20","120")
         self.random_course=True
         self.wait_lock=True
-        self.drive_options=("2","4","15","73","90","0.25","0.08","12")
+        self.drive_options=("2","4","15","73","90","0.25","0.08","12","6","400")
         self.drive_random=True
         self.drive_wait=True
         self.auto_fit = True
@@ -294,6 +294,9 @@ class Workbench:
                 messagebox.showerror("输入无效",hint,parent=self.root)
                 return
             edits[key]=x%360 if key in ("az","heading") else x
+        if "height" in edits and edits["height"]!=self.sim.bounded_height(self.poses[i],edits["height"]):
+            messagebox.showerror("高度无效",f"机端海拔至少要比车端高 {MIN_HEIGHT_GAP_M:g} m。",parent=self.root)
+            return
         for key,x in edits.items():
             obj=self.sim.axes[i] if key in ("az","el") else self.poses[i]
             setattr(obj,key,x)
@@ -319,6 +322,8 @@ class Workbench:
 
     def reset(self):
         fresh = Simulation()
+        if self.sim.max_slant>fresh.distance:
+            fresh.max_slant=self.sim.max_slant
         fresh.set_thresholds(self.sim.fixed_thresholds)
         fresh.realign_pending=False  # already at the initial geometric point
         for new, old in zip(fresh.axes, self.sim.axes):
@@ -355,8 +360,13 @@ class Workbench:
         entries=[]
         labels=["最低速度 (m/s)","最高速度 (m/s)","每段时长 (s)","随机种子","固定行进方向 (°，北为 0)"]
         if ground:
-            labels.extend(["最大转向速度 (°/s)","路面起伏幅值 (m，0 为平路)","路面基准波长 (m)"])
-        for row,(label,value) in enumerate(zip(labels,self.drive_options if ground else self.flight_options)):
+            labels.extend(["最大转向速度 (°/s)","颠簸幅值 (m)","颠簸基准波长 (m)",
+                           "坡道高度幅值 (m)","坡道波长 (m)"])
+        else:
+            labels.extend(["相对起始高度幅值 (±m)","升降周期 (s)"])
+        labels.append("两站共用斜距上限 (m)")
+        options=self.drive_options if ground else self.flight_options
+        for row,(label,value) in enumerate(zip(labels,(*options,f"{self.sim.max_slant:g}"))):
             ttk.Label(form,text=label).grid(row=row,column=0,sticky="w")
             entry=ttk.Entry(form,width=12)
             entry.insert(0,value)
@@ -368,18 +378,21 @@ class Workbench:
         ttk.Checkbutton(form,text="每段随机方向",variable=random_course,command=update_course).grid(row=row,columnspan=2,sticky="w")
         update_course()
         ttk.Checkbutton(form,text="先锁定，再开始移动",variable=wait_lock).grid(row=row+1,columnspan=2,sticky="w")
-        hint=("车辆从当前车头方向逐步转弯。路面波长越短，同速下颠簸越频繁。"
-              if ground else "等高平移，机头航向独立。速度上下限相同即匀速。")
+        hint=("坡道随行驶里程改变海拔，可与短波颠簸叠加。"
+              if ground else "高度围绕起始海拔平滑升降，幅值填 0 可等高飞行。")
         ttk.Label(form,text=hint,wraplength=300).grid(row=row+2,columnspan=2,pady=4)
         error=ttk.Label(form,foreground="#aa4227",wraplength=300)
         error.grid(row=row+3,columnspan=2)
         def start():
-            values=tuple(entry.get() for entry in entries)
+            values=tuple(entry.get() for entry in entries[:-1])
             try:
                 low,high,interval=map(float,values[:3])
                 course=None if random_course.get() else float(values[4])
                 args=(low,high,course,interval,int(values[3]),wait_lock.get())
-                run=DriveTest(*args,*map(float,values[5:])) if ground else FlightTest(*args)
+                run=(DriveTest if ground else FlightTest)(*args,*map(float,values[5:]))
+                limit=float(entries[-1].get())
+                if self.sim.motion_center is None or limit!=self.sim.max_slant:
+                    self.sim.reset_motion_area(limit)
             except ValueError as exc:
                 error.configure(text=f"请检查输入（随机种子为整数）。{exc}")
                 return
@@ -572,7 +585,8 @@ class Workbench:
         else:
             bottom=self.canvas.winfo_height()-26
             py=max(h+33,min(bottom,e.y+dx))
-            p.height=self.zmin+(bottom-py)*self.zspan/max(1,bottom-h-31)
+            height=self.zmin+(bottom-py)*self.zspan/max(1,bottom-h-31)
+            p.height=self.sim.bounded_height(p,height)
             keys=("height",)
         for key in keys:self.pending.discard((i,key))
         self.sim.measure_link()
@@ -664,7 +678,7 @@ class Workbench:
             color=(AIR,GROUND)[i]
             c.create_line(px,py,px+vx*scale,py+vy*scale,fill=color,width=3,arrow="last")
             c.create_oval(px-7,py-7,px+7,py+7,fill=color,outline="white",width=2)
-            note(px,py+9,f"{NAMES[i]}  {self.poses[i].height:.1f} m","n",color,9)
+            note(px,py+9,f"{NAMES[i]}  {self.poses[i].height:.2f} m","n",color,9)
 
     def refresh(self):
         s=self.sim
@@ -673,25 +687,26 @@ class Workbench:
         self.stop_flight_btn.configure(state="normal" if flight and flight.active else "disabled")
         summary=""
         if flight:
-            status="已停止" if not flight.active else "等待锁定" if flight.waiting else "飞行中"
-            summary=(f"{status}  {flight.ticks*DT:.1f} s　{flight.speed:.1f} m/s　航迹 {flight.course:.0f}°"
+            status="已停止" if not flight.active else "等待锁定" if flight.waiting else "边界折返" if flight.returning else "飞行中"
+            summary=(f"{status}  {flight.ticks*DT:.1f} s　{flight.actual_speed if flight.active else 0:.1f} m/s　航迹 {flight.course:.0f}°"
                      f"　有效跟踪 {flight.track_ticks*DT:.1f} s　失锁 {flight.losses}　回几何 {flight.near_returns}")
             if MODES[o.phase]=="TRACK":
                 summary+=f"\n车端峰心　方位 {o.center_az:.2f}°　仰角 {o.center_el:.2f}°"
-        self.flight_status.configure(text=summary)
+        self.flight_status.configure(text=summary+(f"　{flight.stop_reason}" if flight and flight.stop_reason else ""))
         drive=s.drive
         self.stop_drive_btn.configure(state="normal" if drive and drive.active else "disabled")
         summary=""
         if drive:
-            status="已停车" if not drive.active else "等待锁定" if drive.waiting else "行车中"
-            summary=(f"{status}  {drive.ticks*DT:.1f} s　{drive.speed if drive.active else 0:.1f} m/s"
+            status="已停车" if not drive.active else "等待锁定" if drive.waiting else "边界折返" if drive.returning else "行车中"
+            summary=(f"{status}  {drive.ticks*DT:.1f} s　{drive.actual_speed if drive.active else 0:.1f} m/s"
                      f"　车头 {s.ground.heading:.1f}°　纵倾 {s.axes[1].body_pitch:+.2f}°"
                      f"　侧倾 {s.axes[1].body_roll:+.2f}°　起伏 {drive.heave:+.2f} m"
                      f"\n有效跟踪 {drive.track_ticks*DT:.1f} s　失锁 {drive.losses}　回几何 {drive.near_returns}")
-        self.drive_status.configure(text=summary)
+        self.drive_status.configure(text=summary+(f"　{drive.stop_reason}" if drive and drive.stop_reason else ""))
         if self.auto_fit and self.drag is None and any(r and r.active for r in (flight,drive)):
-            if any(not (15<x<self.map_width()-15 and 15<y<self.map_height()-15)
-                   for x,y in map(self.xy,self.poses)):
+            if (any(not (15<x<self.map_width()-15 and 15<y<self.map_height()-15)
+                    for x,y in map(self.xy,self.poses)) or
+                any(not self.zmin<=p.height<=self.zmin+self.zspan for p in self.poses)):
                 self.fit()
         self.updating=True
         focus_path=str(self.root.tk.call("focus"))
@@ -719,7 +734,8 @@ class Workbench:
                 if o.ground.valid else "等待有效输入")
         self.status.configure(text=f"机端 {MODES[o.air.mode]}  ·  车端 {MODES[o.ground.mode]}\n"
             f"{detail}  /  "
-            f"信标 {'检出' if s.detected else '无'} {s.level:.1f}\n斜距 {s.distance:.1f} m")
+            f"信标 {'检出' if s.detected else '无'} {s.level:.1f}\n斜距 {s.distance:.1f} m　自动运动上限 {s.max_slant:g} m"
+            f"\n机端高于车端 {s.air.height-s.ground.height:.2f} m")
         self.reason.configure(text="最近跳转　"+s.events[-1][3])
         self.realign_btn.configure(text="等待下一控制拍" if s.realign_pending else "重新几何对准",
                                    state="disabled" if s.realign_pending else "normal")

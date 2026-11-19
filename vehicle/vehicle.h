@@ -44,6 +44,9 @@ typedef struct {
 
 typedef enum { REALIGN_NONE, REALIGN_SIGNAL, REALIGN_ACK, REALIGN_REQUEST } RealignReason;
 
+#define TRACK_HISTORY_SIZE 24
+typedef struct { float az, el, level; uint32_t stamp; } TrackSample;
+
 typedef struct {
     VehicleConfig cfg;
     double refine_span;
@@ -57,6 +60,10 @@ typedef struct {
     double cross_score[5];
     int prior_slope[2]; /* previous tracking cross, azimuth and elevation */
     double last_track_az_step, last_track_el_step;
+    TrackSample track_history[TRACK_HISTORY_SIZE];
+    unsigned track_count, track_next;
+    bool probe_el_first;
+    uint32_t last_track_fit_ms;
     Command command;
     bool commanded, settling;
     uint32_t moved_ms, stable_ms, last_sample_ms;
@@ -76,6 +83,7 @@ typedef struct {
     double peak_above_gate; /* last confirmed center relative to its range-dependent gate */
     double confirmed_air_az, confirmed_air_el;
     bool verify_previous_trim;
+    unsigned rx_verify_retries;
     unsigned low_center_rounds;
     bool retry_center, missed_beacon;
     double saved_az, saved_el, saved_air_az, saved_air_el;

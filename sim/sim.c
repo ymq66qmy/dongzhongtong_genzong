@@ -364,7 +364,33 @@ static void check_realign_interrupts(void) {
     }
 }
 
+static void check_transit_sample_timestamps(void) {
+    Vehicle v;
+    vehicle_init(&v);
+    v.mode=TRACK;
+    v.cfg.rx_half_power_deg=6;
+    v.request=(AirRequest){.session=1,.point=7};
+    VehicleInput in={.session=1,.air={1,7,true},.rssi_valid=true,.rssi=-85,
+                     .link={.enabled=true,.local_ok=true,.peer_ok=true,.actual={.valid=true}}};
+    in.link.actual.stamp_ms=in.sample_ms=100;
+    vehicle_step(&v,100,&in);
+    assert(v.track_count==1);
+    vehicle_step(&v,110,&in); /* duplicate RSSI */
+    assert(v.track_count==1);
+    in.sample_ms=140;
+    in.link.actual.stamp_ms=120; /* fresh separately, but not simultaneous */
+    vehicle_step(&v,140,&in);
+    assert(v.track_count==0);
+    in.link.actual.stamp_ms=in.sample_ms=180;
+    vehicle_step(&v,180,&in);
+    assert(v.track_count==1);
+    in.air.arrived=false;
+    vehicle_step(&v,190,&in);
+    assert(v.track_count==0);
+}
+
 int main(int argc,char **argv) {
+    check_transit_sample_timestamps();
     check_realign_interrupts();
     check_inputs();
     check_pitch_convention();

@@ -3,7 +3,7 @@ import unittest
 from statistics import median
 from unittest.mock import patch
 
-from antenna_model import Axes, DriveTest, FlightTest, MODES, Pose, Simulation, beam_direction, off_axis, wrap_diff
+from antenna_model import Axes, DriveTest, FlightTest, MIN_HEIGHT_GAP_M, MODES, Pose, Simulation, beam_direction, off_axis, wrap_diff
 
 
 class LockRecoveryTest(unittest.TestCase):
@@ -149,6 +149,81 @@ class LockRecoveryTest(unittest.TestCase):
         self.advance(8999)
         self.assertGreater(s.drive.track_ticks, 8500)
         self.assertEqual((s.drive.losses, s.drive.near_returns), (0, 0))
+
+    def test_simultaneous_climb_turn_and_grade_keep_the_link(self):
+        s = self.sim
+        self.wait_for(lambda: s.ms == 30000, 31)
+        self.assertTrue(s.aligned_lock)
+        s.flight = FlightTest(2, 3, None, 15, 42, False, 20, 120)
+        s.drive = DriveTest(2, 4, None, 15, 73, False, 1, .08, 12, 6, 400)
+        self.advance(18000)
+        self.assertEqual((s.flight.losses, s.flight.near_returns), (0, 0))
+        self.assertGreater(s.flight.track_ticks, 17700)
+
+    def test_opposing_routes_turn_back_and_change_height(self):
+        s = self.sim
+        s.reset_motion_area(1000)
+        s.flight = FlightTest(35, 35, 45, 15, 42, False, 20, 120)
+        s.drive = DriveTest(15, 15, 225, 15, 73, False, 8, .08, 12, 6, 400)
+        routes = (s.flight, s.drive)
+        completed_turns = [0, 0]
+        air_heights, ground_heights = [], []
+        for tick in range(18000):
+            returning = [r.returning for r in routes]
+            s.step()
+            self.assertLessEqual(s.distance, 1000)
+            for i, run in enumerate(routes):
+                completed_turns[i] += int(returning[i] and not run.returning)
+                self.assertTrue(run.active)
+            if tick % 100 == 0:
+                air_heights.append(s.air.height)
+                ground_heights.append(s.ground.height)
+        self.assertGreater(min(completed_turns), 0)
+        self.assertGreater(max(air_heights)-min(air_heights), 39)
+        self.assertGreater(max(ground_heights)-min(ground_heights), 11)
+
+    def test_invalid_range_and_manual_move_do_not_teleport_stations(self):
+        s = self.sim
+        with self.assertRaises(ValueError):
+            s.reset_motion_area(100)
+        s.flight = FlightTest(3, 3, None, 15, 42, False, 20, 120)
+        s.step()
+        s.ground.lon += 1
+        before = bytes(s.air), bytes(s.ground)
+        s.step()
+        self.assertFalse(s.flight.active)
+        self.assertTrue(s.flight.stop_reason)
+        self.assertEqual((bytes(s.air), bytes(s.ground)), before)
+
+    def test_descending_aircraft_and_uphill_vehicle_keep_positive_height_gap(self):
+        s = self.sim
+        s.air.height = s.ground.height + 0.05
+        s.reset_motion_area(1000)
+        s.flight = FlightTest(0, 0, 0, 15, 42, False, 2, 4)
+        s.drive = DriveTest(4, 4, s.ground.heading, 15, 73, False, 1, .08, 12, 8, 160)
+        reached_floor = False
+        for _ in range(1200):
+            s.step()
+            self.assertGreaterEqual(s.air.height, s.ground.height + MIN_HEIGHT_GAP_M)
+            self.assertLessEqual(s.distance, 1000)
+            reached_floor |= s.air.height == s.ground.height + MIN_HEIGHT_GAP_M
+        self.assertTrue(reached_floor)
+        self.assertGreater(s.ground.height, 35)
+        self.assertGreater(s.drive.distance, 47)
+
+    def test_uphill_vehicle_waits_below_stationary_aircraft(self):
+        s = self.sim
+        s.air.height = s.ground.height + .25
+        parked = bytes(s.air)
+        s.drive = DriveTest(4, 4, 22, 15, 73, False, 1, 0, 12, 8, 160)
+        self.advance(300)
+        self.assertEqual(bytes(s.air), parked)
+        self.assertGreater(s.air.height, s.ground.height)
+        self.assertEqual(s.drive.actual_speed, 0)
+        self.assertGreater(s.drive.distance, 0)
+        s.air.height += 3
+        self.advance(10)
+        self.assertGreater(s.drive.actual_speed, 0)
 
     def test_nearby_moving_aircraft_relocks_after_one_second_blackout(self):
         s = self.sim

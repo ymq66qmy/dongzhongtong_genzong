@@ -15,6 +15,7 @@ typedef struct {
 /* One zero-initialized object per aircraft. Retain across takeoff and landing. */
 typedef struct { Fix fix; Velocity estimate; } MotionSample;
 typedef struct { MotionSample local, peer; } AirHistory;
+void airborne_track_init(AirHistory *history);
 Command airborne_track_step(AirHistory *history, uint32_t now, const AirInput *in, AirReply *reply);
 Command airborne_point_step(uint32_t now, const AirInput *in, AirReply *reply);
 Command airborne_step(uint32_t now, const AirInput *in);

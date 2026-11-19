@@ -24,6 +24,11 @@ static Offset cross_point(int i, double span) {
     return (Offset){cross[i][0]*span,cross[i][1]*span};
 }
 
+static int cross_index(const Vehicle *v, int point) {
+    static const int elevation_first[5]={0,3,4,1,2};
+    return v->mode==TRACK && v->probe_el_first ? elevation_first[point] : point;
+}
+
 static Offset offset(const Vehicle *v, int i) {
     const VehicleConfig *cfg=&v->cfg;
     Mode mode=v->mode;
@@ -58,7 +63,7 @@ static Offset offset(const Vehicle *v, int i) {
         return (Offset){(col-r)*cfg->recover_step_deg,(row-r)*cfg->recover_step_deg};
     }
     double span = mode == TRACK ? cfg->probe_deg : v->refine_span;
-    return cross_point(i,span);
+    return cross_point(cross_index(v,i),span);
 }
 
 static double limit_el(double angle) {
@@ -79,6 +84,7 @@ static void start_pattern(Vehicle *v, Mode mode) {
     if (mode!=TRACK) v->prior_slope[0]=v->prior_slope[1]=0;
     if (mode!=TRACK) v->last_track_az_step=v->last_track_el_step=0;
     if (mode!=TRACK) v->low_center_rounds=0;
+    if (mode!=TRACK) { v->track_count=0; v->probe_el_first=false; }
     if (mode!=TRACK && mode!=CAL_AIR) v->monitoring_lock=false;
     v->point=0;
     v->best_point=0;
@@ -260,7 +266,11 @@ static void finish_air_round(Vehicle *v, uint32_t now) {
         if (v->verify_previous_trim &&
             (v->samples!=v->cfg.sample_count || v->detected_samples!=v->cfg.sample_count ||
              v->center_score-v->cfg.acquire_level<v->peak_above_gate-v->cfg.peak_margin)) {
-            start_air_cal(v);
+            if (v->rx_verify_retries<2 && v->detected_samples==v->cfg.sample_count &&
+                v->center_score>=v->cfg.release_level) {
+                ++v->rx_verify_retries;
+                start_refine(v);
+            } else start_air_cal(v);
             return;
         }
         if (v->samples==v->cfg.sample_count && v->center_score>=v->cfg.acquire_level) {
@@ -270,6 +280,7 @@ static void finish_air_round(Vehicle *v, uint32_t now) {
             v->peak_above_gate=v->center_score-v->cfg.acquire_level;
             v->weak_rounds=0;
             v->ever_locked=v->monitoring_lock=true;
+            v->rx_verify_retries=0;
             v->retry_center=false;
             v->weak_stream=false;
             v->weak_sample_ms=now;
@@ -324,11 +335,79 @@ static void next_coarse_pair(Vehicle *v) {
 
 static bool acquiring(Mode mode) { return mode==NEAR || mode==SWEEP; }
 
+/* Measure the RSSI slope during the transit between probes as well as at
+   their endpoints. Fit level+k*(x*x+y*y) to encoder angles and time.
+   Removing a linear time trend separates common fading from angular gain. */
+static void follow_encoder_samples(Vehicle *v, const VehicleInput *in, uint32_t now) {
+    const VehicleConfig *cfg=&v->cfg;
+    const GimbalAngles *enc=&in->link.actual;
+    if (cfg->rx_half_power_deg<=0 || cfg->pair_margin<=0) return;
+    uint32_t age=now-in->sample_ms, enc_age=now-enc->stamp_ms;
+    if (!in->rssi_valid || !between(in->rssi,fmax(-120,cfg->release_level-3),0) ||
+        (in->has_beacon_flag && !in->beacon_present) || age>30 || enc_age>30 ||
+        fabs((double)age-enc_age)>10) {
+        v->track_count=0;
+        return;
+    }
+    if (v->track_count) {
+        unsigned last=(v->track_next+TRACK_HISTORY_SIZE-1)%TRACK_HISTORY_SIZE;
+        uint32_t gap=in->sample_ms-v->track_history[last].stamp;
+        if (gap<40 || gap>=0x80000000u) return;
+        if (gap>100) v->track_count=0;
+    }
+    const GimbalFrame *f=&in->link.frame;
+    double az=wrap360((enc->az_deg-f->az_zero_deg)*(f->reverse_az ? -1 : 1));
+    double el=(enc->el_deg-f->el_zero_deg)*(f->reverse_el ? -1 : 1);
+    v->track_history[v->track_next]=(TrackSample){(float)az,(float)el,(float)in->rssi,in->sample_ms};
+    v->track_next=(v->track_next+1)%TRACK_HISTORY_SIZE;
+    if (v->track_count<TRACK_HISTORY_SIZE) ++v->track_count;
+    if (v->track_count<TRACK_HISTORY_SIZE || now-v->last_track_fit_ms<200 || in->rssi<cfg->release_level ||
+        in->rssi-cfg->acquire_level>v->peak_above_gate-cfg->peak_margin ||
+        (cfg->air_recheck_ms && now-v->last_air_cal_ms>=cfg->air_recheck_ms)) return;
+    v->last_track_fit_ms=now;
+    double horizontal=cos(v->center_el*0.017453292519943295);
+    if (horizontal<0.25) return;
+    double k=3.0/(cfg->rx_half_power_deg*cfg->rx_half_power_deg);
+    double sx=0,sy=0,st=0,sz=0,xx=0,yy=0,tt=0,xy=0,xt=0,yt=0,xz=0,yz=0,tz=0;
+    for (unsigned i=0;i<TRACK_HISTORY_SIZE;++i) {
+        const TrackSample *s=&v->track_history[i];
+        double x=shortest_angle(s->az-v->center_az)*horizontal, y=s->el-v->center_el;
+        double t=(now-s->stamp)*0.001, z=s->level-in->rssi+k*(x*x+y*y);
+        sx+=x; sy+=y; st+=t; sz+=z;
+        xx+=x*x; yy+=y*y; tt+=t*t; xy+=x*y; xt+=x*t; yt+=y*t;
+        xz+=x*z; yz+=y*z; tz+=t*z;
+    }
+    const double n=TRACK_HISTORY_SIZE;
+    tt-=st*st/n; xt-=sx*st/n; yt-=sy*st/n; tz-=st*sz/n;
+    if (tt<=0) return;
+    xx-=sx*sx/n+xt*xt/tt; yy-=sy*sy/n+yt*yt/tt;
+    xy-=sx*sy/n+xt*yt/tt;
+    xz-=sx*sz/n+xt*tz/tt; yz-=sy*sz/n+yt*tz/tt;
+    double det=xx*yy-xy*xy;
+    /* Minimum residual variance in squared degrees after removing the time trend.
+       A straight single-axis traverse only identifies that axis. */
+    double min_spread=n*0.025;
+    double dx=0,dy=0;
+    if (det>min_spread*fmax(xx,yy)) {
+        dx=(yy*xz-xy*yz)/det; dy=(xx*yz-xy*xz)/det;
+    } else if (xx>min_spread && yy<0.1*min_spread) dx=xz/xx;
+    else if (yy>min_spread && xx<0.1*min_spread) dy=yz/yy;
+    else return;
+    if (hypot(dx,dy)*cfg->probe_deg<2*cfg->pair_margin) return;
+    double bound=cfg->probe_deg;
+    dx=fmax(-bound,fmin(bound,0.45*dx/(2*k*horizontal)));
+    dy=fmax(-bound,fmin(bound,0.45*dy/(2*k)));
+    v->center_az=wrap360(v->center_az+dx);
+    v->center_el=limit_el(v->center_el+dy);
+    v->probe_el_first=!v->probe_el_first;
+    start_pattern(v,TRACK);
+}
+
 static void finish_point(Vehicle *v, double score, const GimbalFrame *f, uint32_t now) {
     const VehicleConfig *cfg=&v->cfg;
     Mode mode=v->mode;
     if ((mode==REFINE || mode==TRACK || mode==CAL_AIR) && v->point<5)
-        v->cross_score[v->point]=v->detected_samples==cfg->sample_count ? score : NO_BEACON_SCORE;
+        v->cross_score[cross_index(v,v->point)]=v->detected_samples==cfg->sample_count ? score : NO_BEACON_SCORE;
     if (v->point==0) v->center_score=score;
     if (score>v->best_score) { v->best_score=score; v->best_point=v->point; }
     v->commanded=false;
@@ -353,6 +432,8 @@ static void finish_point(Vehicle *v, double score, const GimbalFrame *f, uint32_
     }
     if (mode==RECOVER && cfg->fast_relock && v->ever_locked &&
         v->samples==cfg->sample_count && (score>=cfg->acquire_level ||
+        (!v->point && cfg->rx_half_power_deg>0 && v->detected_samples==cfg->sample_count &&
+         score>=cfg->release_level-3.0) ||
         (score>=cfg->acquire_level-8.0 && stronger_neighbor(v)))) {
         apply_peak(v);
         start_refine(v);
@@ -441,12 +522,23 @@ static void finish_point(Vehicle *v, double score, const GimbalFrame *f, uint32_
         if (v->best_score==NO_BEACON_SCORE) { start_pattern(v,RECOVER); return; }
         /* A moving peak need not have a stationary encoder center. If two
            complete near-peak crosses agree, verify the fitted point there. */
-        bool near_peak=cfg->fast_acquire && cfg->rx_half_power_deg>0 &&
+        bool complete_cross=true;
+        for (int i=0;i<5;++i)
+            if (v->cross_score[i]==NO_BEACON_SCORE) complete_cross=false;
+        bool near_peak=complete_cross && cfg->fast_acquire && cfg->rx_half_power_deg>0 &&
                        v->cross_score[0]>=cfg->acquire_level &&
                        v->best_score<=v->center_score+cfg->peak_margin;
-        for (int i=1;near_peak && i<5;++i)
-            near_peak=v->cross_score[i]!=NO_BEACON_SCORE;
         v->strong_crosses=near_peak ? v->strong_crosses+1 : 0;
+        /* The measured peak can keep moving throughout an otherwise strong
+           RX cross. Re-test the fitted center before starting a slow TX sweep. */
+        if (cfg->fast_relock && cfg->rx_half_power_deg>0 && v->ever_locked &&
+            v->air_az==v->confirmed_air_az && v->air_el==v->confirmed_air_el &&
+            improved && complete_cross && v->center_score>=cfg->release_level &&
+            v->best_score-cfg->acquire_level>=v->peak_above_gate-cfg->peak_margin) {
+            start_air_cal(v);
+            v->confirm_lock=v->verify_previous_trim=true;
+            return;
+        }
         if ((!improved || v->strong_crosses>=2) && (v->fast_probe || cfg->fast_acquire) &&
             v->samples==cfg->sample_count && v->center_score>=cfg->acquire_level) {
             start_air_cal(v);
@@ -554,6 +646,7 @@ Command vehicle_step(Vehicle *v, uint32_t now, const VehicleInput *in) {
     if (reason!=REALIGN_NONE) {
         bool ever_locked=v->ever_locked;
         double peak_above_gate=v->peak_above_gate;
+        double confirmed_az=v->confirmed_air_az, confirmed_el=v->confirmed_air_el;
         bool retry=reason==REALIGN_SIGNAL && v->monitoring_lock &&
                    v->cfg.fast_relock && in->has_beacon_flag && !in->beacon_present;
         double old_az=v->center_az, old_el=v->center_el;
@@ -561,6 +654,8 @@ Command vehicle_step(Vehicle *v, uint32_t now, const VehicleInput *in) {
         restart(v,*cfg); /* drop old trim, peak, samples and outstanding point token */
         v->ever_locked=ever_locked;
         v->peak_above_gate=peak_above_gate;
+        v->confirmed_air_az=confirmed_az;
+        v->confirmed_air_el=confirmed_el;
         if (retry) {
             /* A blackout at a confirmed peak permits one historical probe only
                after the fresh geometric trial and a genuine signal return. */
@@ -614,6 +709,8 @@ Command vehicle_step(Vehicle *v, uint32_t now, const VehicleInput *in) {
         }
     }
     bool air_ready=matched && in->air.arrived;
+    if (v->mode==TRACK && air_ready) follow_encoder_samples(v,in,now);
+    else v->track_count=0;
     if (!matched || air_ready) v->air_waiting=false;
     else if (!v->air_waiting) {
         v->air_waiting=true;

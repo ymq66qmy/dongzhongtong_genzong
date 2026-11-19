@@ -1,5 +1,10 @@
 #include "airborne.h"
 #include <math.h>
+
+void airborne_track_init(AirHistory *history) {
+    *history=(AirHistory){0};
+}
+
 static Command aim(uint32_t now, const AirInput *in, AirReply *reply, Command c) {
     *reply=(AirReply){0};
     if (!c.valid) return c;
