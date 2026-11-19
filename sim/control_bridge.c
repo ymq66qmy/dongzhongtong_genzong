@@ -43,6 +43,7 @@ API Control *control_new(void) {
     c->scanner.cfg.fast_acquire=true;
     c->scanner.cfg.recover_radius_points=1;
     c->scanner.cfg.track_weak_ms=250;
+    c->scanner.cfg.rx_half_power_deg=6; /* half-power half-angle of the simulated receiver */
     c->air.link.enabled=c->ground.link.enabled=true;
     c->air.link.local_ok=c->ground.link.local_ok=true;
     c->ground.session=1;

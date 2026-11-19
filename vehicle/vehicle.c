@@ -75,7 +75,7 @@ static void start_pattern(Vehicle *v, Mode mode) {
         v->missed_beacon=false;
     }
     v->mode=mode;
-    if (mode!=CAL_AIR) v->trial_trim=false;
+    if (mode!=CAL_AIR) v->trial_trim=v->verify_previous_trim=false;
     if (mode!=TRACK) v->prior_slope[0]=v->prior_slope[1]=0;
     if (mode!=TRACK) v->last_track_az_step=v->last_track_el_step=0;
     if (mode!=TRACK) v->low_center_rounds=0;
@@ -129,7 +129,8 @@ bool vehicle_configure(Vehicle *v, const VehicleConfig *c) {
         !between(c->air_min_deg,0.01,c->air_refine_deg) ||
         !c->air_max_rounds || c->air_max_rounds>1000 ||
         !between(c->near_step_deg,0.01,90) || !between(c->detect_level,-120,c->release_level) ||
-        !between(c->realign_drop_db,0,120) || !between(c->pair_margin,0,120)) return false;
+        !between(c->realign_drop_db,0,120) || !between(c->pair_margin,0,120) ||
+        !between(c->rx_half_power_deg,0,90)) return false;
     restart(v,*c);
     return true;
 }
@@ -152,6 +153,7 @@ static Offset air_offset(const Vehicle *v, int i) {
 
 static void start_air_cal(Vehicle *v) {
     v->trial_trim=false;
+    v->verify_previous_trim=false;
     v->confirm_lock=false;
     v->ground_refresh=false;
     v->air_rounds=0;
@@ -161,6 +163,7 @@ static void start_air_cal(Vehicle *v) {
 
 static void start_refine(Vehicle *v) {
     v->refined=false;
+    v->strong_crosses=0;
     v->refine_rounds=0;
     v->fast_probe=v->cfg.fast_acquire || (v->cfg.fast_relock && v->ever_locked);
     v->refine_span=v->fast_probe ? v->cfg.probe_deg : v->cfg.refine_start_deg;
@@ -176,6 +179,32 @@ static bool stronger_neighbor(const Vehicle *v) {
    peak. Lead by at most one measured step; stop on reversal or no correction. */
 static double motion_lead(double step, double previous) {
     return step*previous>0 ? copysign(fmin(fabs(step),fabs(previous)),step) : 0;
+}
+
+/* For a calibrated main lobe P(x)=Pmax-k*(x-peak)^2, opposite probes
+   differ by 4*k*span*(peak-center). Normalize azimuth by cos(elevation).
+   Only use complete, strong windows; the ordinary search handles sidelobes. */
+static bool fit_rx_peak(const Vehicle *v, double el, double span, Offset *step) {
+    const VehicleConfig *cfg=&v->cfg;
+    if (cfg->rx_half_power_deg<=0 || cfg->pair_margin<=0 ||
+        v->cross_score[0]<cfg->acquire_level-4.0) return false;
+    double k=3.0/(cfg->rx_half_power_deg*cfg->rx_half_power_deg);
+    double horizontal=cos(el*0.017453292519943295);
+    bool fitted=false;
+    for (int axis=0;axis<2;++axis) {
+        double pos=v->cross_score[1+axis*2], neg=v->cross_score[2+axis*2];
+        if (pos==NO_BEACON_SCORE || neg==NO_BEACON_SCORE ||
+            fabs(pos-neg)<=2*cfg->pair_margin ||
+            (axis && (el<span || el+span>90)) || (!axis && horizontal<0.25)) continue;
+        double slope=axis ? k : k*horizontal*horizontal;
+        double correction=(pos-neg)/(4*slope*span);
+        double bound=2*span;
+        correction=fmax(-bound,fmin(bound,correction));
+        if (axis) step->el=correction;
+        else step->az=correction;
+        fitted=true;
+    }
+    return fitted;
 }
 
 /* Near a smooth maximum, fit a parabola through each symmetric triplet.
@@ -228,8 +257,16 @@ static void finish_air_round(Vehicle *v, uint32_t now) {
     if (v->best_score==NO_BEACON_SCORE) { start_pattern(v,RECOVER); return; }
     if (v->confirm_lock) {
         v->confirm_lock=false;
+        if (v->verify_previous_trim &&
+            (v->samples!=v->cfg.sample_count || v->detected_samples!=v->cfg.sample_count ||
+             v->center_score-v->cfg.acquire_level<v->peak_above_gate-v->cfg.peak_margin)) {
+            start_air_cal(v);
+            return;
+        }
         if (v->samples==v->cfg.sample_count && v->center_score>=v->cfg.acquire_level) {
             v->last_air_cal_ms=now;
+            v->confirmed_air_az=v->air_az;
+            v->confirmed_air_el=v->air_el;
             v->peak_above_gate=v->center_score-v->cfg.acquire_level;
             v->weak_rounds=0;
             v->ever_locked=v->monitoring_lock=true;
@@ -381,22 +418,46 @@ static void finish_point(Vehicle *v, double score, const GimbalFrame *f, uint32_
                 else az_step=step;
             }
         }
-        v->center_az=wrap360(old_az+az_step+motion_lead(az_step,v->last_track_az_step));
-        v->center_el=limit_el(old_el+el_step+motion_lead(el_step,v->last_track_el_step));
+        Offset fitted={az_step,el_step};
+        bool calibrated=fit_rx_peak(v,old_el,cfg->probe_deg,&fitted);
+        az_step=fitted.az;
+        el_step=fitted.el;
+        double lead=calibrated ? 0.5 : 1.0;
+        v->center_az=wrap360(old_az+az_step+lead*motion_lead(az_step,v->last_track_az_step));
+        v->center_el=limit_el(old_el+el_step+lead*motion_lead(el_step,v->last_track_el_step));
         improved=az_step!=0 || el_step!=0;
         v->last_track_az_step=az_step;
         v->last_track_el_step=el_step;
     }
 
     if (mode==REFINE) {
+        Offset fitted={shortest_angle(v->center_az-old_az),v->center_el-old_el};
+        if (fit_rx_peak(v,old_el,v->refine_span,&fitted)) {
+            v->center_az=wrap360(old_az+fitted.az);
+            v->center_el=limit_el(old_el+fitted.el);
+            improved=fabs(fitted.az)>cfg->arrival_tolerance_deg ||
+                     fabs(fitted.el)>cfg->arrival_tolerance_deg;
+        }
         if (v->best_score==NO_BEACON_SCORE) { start_pattern(v,RECOVER); return; }
-        if (!improved && (v->fast_probe || cfg->fast_acquire) &&
+        /* A moving peak need not have a stationary encoder center. If two
+           complete near-peak crosses agree, verify the fitted point there. */
+        bool near_peak=cfg->fast_acquire && cfg->rx_half_power_deg>0 &&
+                       v->cross_score[0]>=cfg->acquire_level &&
+                       v->best_score<=v->center_score+cfg->peak_margin;
+        for (int i=1;near_peak && i<5;++i)
+            near_peak=v->cross_score[i]!=NO_BEACON_SCORE;
+        v->strong_crosses=near_peak ? v->strong_crosses+1 : 0;
+        if ((!improved || v->strong_crosses>=2) && (v->fast_probe || cfg->fast_acquire) &&
             v->samples==cfg->sample_count && v->center_score>=cfg->acquire_level) {
             start_air_cal(v);
             /* New links still probe both TX axes. A previously calibrated link
                may reuse its trim, subject to a fresh on-center confirmation. */
             v->confirm_lock=v->ever_locked && cfg->fast_relock &&
                 v->center_score-cfg->acquire_level>=v->peak_above_gate-2*cfg->pair_margin;
+            if (!v->confirm_lock && near_peak && cfg->fast_relock && v->ever_locked &&
+                v->air_az==v->confirmed_air_az && v->air_el==v->confirmed_air_el) {
+                v->confirm_lock=v->verify_previous_trim=true;
+            }
             return;
         }
         if (v->fast_probe) {

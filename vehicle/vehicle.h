@@ -21,6 +21,7 @@ typedef struct {
     double realign_drop_db; /* severe RSSI threshold = release_level - this margin */
     uint32_t realign_weak_ms, realign_ack_ms; /* zero disables the corresponding guard */
     double pair_margin; /* opposite-point difference in dB; 0 disables sub-step fitting */
+    double rx_half_power_deg; /* measured one-sided -3 dB angle; 0 disables calibrated peak estimates */
 } VehicleConfig;
 
 extern const VehicleConfig vehicle_defaults;
@@ -49,6 +50,7 @@ typedef struct {
     Mode mode;
     int point, best_point, sweep_row;
     unsigned refine_rounds, weak_rounds;
+    unsigned strong_crosses;
     double center_az, center_el; /* absolute base angles after beacon capture */
     double search_yaw; /* geographic to base yaw offset while acquiring */
     double center_score, best_score;
@@ -72,6 +74,8 @@ typedef struct {
     bool air_waiting;
     bool ever_locked, fast_probe, monitoring_lock, weak_stream;
     double peak_above_gate; /* last confirmed center relative to its range-dependent gate */
+    double confirmed_air_az, confirmed_air_el;
+    bool verify_previous_trim;
     unsigned low_center_rounds;
     bool retry_center, missed_beacon;
     double saved_az, saved_el, saved_air_az, saved_air_el;

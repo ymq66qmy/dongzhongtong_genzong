@@ -141,6 +141,38 @@ class LockRecoveryTest(unittest.TestCase):
         self.assertIsNotNone(s.loss_start_ms)
         self.assertLess(d.track_ticks, d.ticks)
 
+    def test_beacon_tracking_during_vehicle_turns_on_uneven_road(self):
+        s = self.sim
+        s.flight = FlightTest(2, 3, None, 15, 42, True)
+        s.drive = DriveTest(2, 4, None, 15, 73, True, 1, .08, 12)
+        self.wait_for(lambda: s.drive.ticks == 1, 30)
+        self.advance(8999)
+        self.assertGreater(s.drive.track_ticks, 8500)
+        self.assertEqual((s.drive.losses, s.drive.near_returns), (0, 0))
+
+    def test_nearby_moving_aircraft_relocks_after_one_second_blackout(self):
+        s = self.sim
+        s.air = Pose(31.233159, 121.476924, 155, 215)
+        s.ground = Pose(31.234376, 121.477592, 30, 29.06)
+        air, ground = s.axes
+        air.az_speed = ground.az_speed = 25
+        air.az, air.el = 170.28, 39.97
+        ground.az, ground.el = 160.30, 35.74
+        ground.body_pitch, ground.body_roll = -.96, .59
+        s.flight = FlightTest(4.9, 4.9, 249, 15, 42, True)
+        self.wait_for(lambda: s.flight.ticks == 1000, 45)
+        s.blocked = True
+        self.advance(100)
+        self.assertFalse(s.aligned_lock)
+        self.assertIsNotNone(s.loss_start_ms)
+        s.blocked = False
+        self.wait_for(lambda: len(s.relocks) == 1, 8)
+        self.assertTrue(s.aligned_lock)
+        self.assertGreaterEqual(s.level, s.out.acquire)
+        self.advance(9000)
+        self.assertEqual(s.flight.losses, 1)
+        self.assertTrue(s.aligned_lock)
+
     def test_loss_of_peak_triggers_tx_probe_while_above_lock_gate(self):
         s = self.sim
         self.wait_for(lambda: s.first_lock_ms is not None, 25)
