@@ -15,6 +15,36 @@ class LockRecoveryTest(unittest.TestCase):
         for _ in range(ticks):
             self.sim.step()
 
+    def test_call_snapshot_preserves_init_and_actual_lora_inputs(self):
+        s = self.sim
+        first = s.call_snapshot()
+        self.assertEqual(first.now, 0)
+        self.assertFalse(first.initial_history.local.fix.valid)
+        self.assertFalse(first.initial_config.fast_acquire)
+        self.assertTrue(first.startup_config.fast_acquire)
+        old_lat = first.ground.link.peer.lat_deg
+        s.air.lat += 0.001
+        self.advance(10)
+        tick = s.call_snapshot()
+        self.assertEqual(tick.now, 100)
+        self.assertEqual(tick.air.link.local.lat_deg, s.air.lat)
+        self.assertEqual((tick.ground.link.peer.lat_deg, tick.ground.link.peer.stamp_ms), (old_lat, 0))
+        self.assertEqual(tick.ground.link.actual.az_deg, s.axes[1].az)
+        self.assertEqual(tick.ground.rssi, s.level)
+        self.assertEqual(tick.tick_config.acquire_level, s.out.acquire)
+        self.assertEqual(bytes(tick.air_target), bytes(s.out.air))
+        self.assertEqual(bytes(tick.ground_target), bytes(s.out.ground))
+        self.advance(89)
+        previous = s.call_snapshot()
+        s.step()
+        current = s.call_snapshot()
+        self.assertEqual((current.ground.link.peer.lat_deg, current.ground.link.peer.stamp_ms), (s.air.lat, 1000))
+        self.assertEqual(bytes(current.air.request), bytes(previous.request))
+        self.assertEqual(bytes(current.ground.air), bytes(previous.reply))
+        self.assertEqual(current.phase_before, previous.phase_after)
+        self.assertEqual(current.phase_after, s.out.phase)
+        self.assertEqual(bytes(current.initial_config), bytes(first.initial_config))
+
     def wait_for(self, predicate, seconds):
         for _ in range(seconds * 100):
             self.sim.step()

@@ -24,6 +24,21 @@ typedef struct {
     double track_center, track_best, center_az, center_el;
 } Readout;
 
+/* Host-only, read-only data for the call inspector. */
+typedef struct {
+    AirHistory initial_history, history_before;
+    VehicleConfig initial_config, startup_config, tick_config;
+    int initial_phase, phase_before;
+    AirRequest initial_request, request_before;
+    uint32_t now;
+    AirInput air;
+    VehicleInput ground;
+    Target air_target, ground_target;
+    AirReply reply;
+    AirRequest request;
+    int phase_after, holding;
+} CallSnapshot;
+
 typedef struct {
     AirHistory history;
     AirInput air;
@@ -33,6 +48,7 @@ typedef struct {
     bool fixed_thresholds;
     double nominal;
     double track_center, track_best;
+    CallSnapshot calls;
 } Control;
 
 API Control *control_new(void) {
@@ -40,11 +56,16 @@ API Control *control_new(void) {
     if (!c) return NULL;
     airborne_track_init(&c->history);
     vehicle_init(&c->scanner);
+    c->calls.initial_history=c->history;
+    c->calls.initial_config=c->scanner.cfg;
+    c->calls.initial_phase=c->scanner.mode;
+    c->calls.initial_request=c->scanner.request;
     c->scanner.cfg.fast_relock=true;
     c->scanner.cfg.fast_acquire=true;
     c->scanner.cfg.recover_radius_points=1;
     c->scanner.cfg.track_weak_ms=250;
     c->scanner.cfg.rx_half_power_deg=6; /* half-power half-angle of the simulated receiver */
+    c->calls.startup_config=c->scanner.cfg;
     c->air.link.enabled=c->ground.link.enabled=true;
     c->air.link.local_ok=c->ground.link.local_ok=true;
     c->ground.session=1;
@@ -54,6 +75,12 @@ API Control *control_new(void) {
 }
 
 API void control_free(Control *c) { free(c); }
+
+API int control_snapshot(const Control *c, CallSnapshot *out, size_t size) {
+    if (!c || !out || size!=sizeof(*out)) return 0;
+    *out=c->calls;
+    return 1;
+}
 
 static void range_thresholds(Control *c) {
     c->scanner.cfg.acquire_level=fmax(-112.0,c->nominal-2.0);
@@ -127,8 +154,22 @@ API void control_step(Control *c, uint32_t now, const Pose *air, const Pose *gro
     bool retry_center=v->retry_center;
     bool refined=v->refined;
     double old_az=v->center_az, old_el=v->center_el;
+    CallSnapshot *calls=&c->calls;
+    calls->now=now;
+    calls->history_before=c->history;
+    calls->phase_before=v->mode;
+    calls->request_before=v->request;
+    calls->tick_config=v->cfg;
+    calls->air=c->air;
+    calls->ground=c->ground;
     out->air=target(airborne_track_step(&c->history,now,&c->air,&c->reply));
     out->ground=target(vehicle_step(v,now,&c->ground));
+    calls->air_target=out->air;
+    calls->ground_target=out->ground;
+    calls->reply=c->reply;
+    calls->request=v->request;
+    calls->phase_after=v->mode;
+    calls->holding=v->monitoring_lock;
     if (before!=TRACK || v->mode!=TRACK) {
         c->track_center=c->track_best=-121;
     } else if (old_point==4 && v->point==0 && old_probe_el_first==v->probe_el_first) {

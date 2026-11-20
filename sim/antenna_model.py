@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from call_inspector import CallSnapshot, Target
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ["common/link.c", "airborne/airborne.c", "vehicle/vehicle.c", "sim/control_bridge.c"]
@@ -26,10 +27,6 @@ MIN_HEIGHT_GAP_M = 0.01  # one increment on the simulator's altitude inputs
 
 class Pose(C.Structure):
     _fields_ = [(name, C.c_double) for name in ("lat", "lon", "height", "heading")]
-
-
-class Target(C.Structure):
-    _fields_ = [("az", C.c_double), ("el", C.c_double), ("valid", C.c_int), ("mode", C.c_int)]
 
 
 class Readout(C.Structure):
@@ -79,6 +76,8 @@ def controller_library():
     lib.control_new.restype = C.c_void_p
     lib.control_free.argtypes = [C.c_void_p]
     lib.control_free.restype = None
+    lib.control_snapshot.argtypes = [C.c_void_p, C.POINTER(CallSnapshot), C.c_size_t]
+    lib.control_snapshot.restype = C.c_int
     lib.control_thresholds.argtypes = [C.c_void_p, C.c_int, C.c_double, C.c_double,
                                       C.c_double, C.c_double, C.POINTER(Readout)]
     lib.control_thresholds.restype = C.c_int
@@ -368,6 +367,12 @@ class Simulation:
     def clear_tracking_stats(self):
         self.tracking_stats_start_ms = self.ms
         self.effective_tracking_ticks = 0
+
+    def call_snapshot(self):
+        snapshot = CallSnapshot()
+        if not self.lib.control_snapshot(self.handle, C.byref(snapshot), C.sizeof(snapshot)):
+            raise RuntimeError("算法调用快照与本机 C 结构体大小不匹配")
+        return snapshot
 
     @property
     def tracking_stats_seconds(self):

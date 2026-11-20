@@ -4,7 +4,9 @@ import sys
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox
+from tkinter.scrolledtext import ScrolledText
 
+from call_inspector import call_text
 from antenna_model import BEAM_HALF_DEG, DT, DriveTest, FlightTest, MIN_HEIGHT_GAP_M, MODES, Simulation, beam_direction, wrap_diff
 
 INK, MUTED, LINE = "#183538", "#4d6869", "#c8d8d3"
@@ -123,6 +125,7 @@ class Workbench:
         self.event_key = None
         self.speed_dialog = None
         self.threshold_dialog = None
+        self.io_dialog = None
         self.flight_options=("2","3","15","42","90","20","120")
         self.random_course=True
         self.wait_lock=True
@@ -151,6 +154,7 @@ class Workbench:
         ttk.Button(header, text="门限配置", command=self.configure_thresholds).pack(side="right", padx=2)
         self.realign_btn=ttk.Button(header,text="重新几何对准",command=self.request_realign)
         self.realign_btn.pack(side="right",padx=2)
+        ttk.Button(header, text="算法输入输出", command=self.show_algorithm_io).pack(side="right", padx=2)
         main = tk.PanedWindow(root, orient="horizontal", sashwidth=5, bg=LINE, bd=0)
         main.pack(fill="both", expand=True)
         sidebar = tk.Frame(main, bg="white")
@@ -348,6 +352,51 @@ class Workbench:
         self.last_wall = time.perf_counter()
         self.fit()
         self.refresh()
+
+    def show_algorithm_io(self):
+        if self.io_dialog is not None and self.io_dialog.winfo_exists():
+            self.io_dialog.deiconify()
+            self.io_dialog.lift()
+            return
+        window = self.io_dialog = tk.Toplevel(self.root)
+        window.title("算法输入输出")
+        window.geometry(f"{min(760, self.root.winfo_screenwidth()-60)}x{min(680, self.root.winfo_screenheight()-100)}")
+        bar = ttk.Frame(window, padding=8)
+        bar.pack(fill="x")
+        self.io_device = tk.StringVar(window, value="ground")
+        self.io_call = tk.StringVar(window, value="step")
+        for variable, choices in ((self.io_device, (("机载", "air"), ("车载", "ground"))),
+                                  (self.io_call, (("初始化", "init"), ("跟踪调用（10 ms）", "step")))):
+            group = ttk.Frame(bar)
+            group.pack(side="left", padx=(0, 16))
+            for label, key in choices:
+                ttk.Radiobutton(group, text=label, variable=variable, value=key,
+                                command=self.refresh_algorithm_io).pack(side="left")
+        self.io_text = ScrolledText(window, wrap="word", bg="white", fg=INK,
+                                    font=(FONT, 10), padx=12, pady=8, state="disabled")
+        self.io_text.pack(fill="both", expand=True)
+        self.io_view = None
+        self.refresh_algorithm_io()
+
+    def refresh_algorithm_io(self):
+        if self.io_dialog is None or not self.io_dialog.winfo_exists():
+            return
+        view = (self.sim, self.io_device.get(), self.io_call.get())
+        changed = view != self.io_view
+        initialization = self.io_call.get() == "init"
+        now = time.monotonic()
+        if not changed and (initialization or self.io_tick == self.sim.ms or now < self.io_next_refresh):
+            return
+        snapshot = self.sim.call_snapshot()
+        content = call_text(snapshot, self.io_device.get() == "air", initialization, MODES)
+        position = 0.0 if changed else self.io_text.yview()[0]
+        self.io_text.configure(state="normal")
+        self.io_text.delete("1.0", "end")
+        self.io_text.insert("1.0", content)
+        self.io_text.yview_moveto(position)
+        self.io_text.configure(state="disabled")
+        self.io_view, self.io_tick = view, self.sim.ms
+        self.io_next_refresh = now + 0.15
 
     def clear_tracking_stats(self):
         self.sim.clear_tracking_stats()
@@ -690,6 +739,7 @@ class Workbench:
             note(px,py+9,f"{NAMES[i]}  {self.poses[i].height:.2f} m","n",color,9)
 
     def refresh(self):
+        self.refresh_algorithm_io()
         s=self.sim
         o=s.out
         effective, elapsed = s.tracking_stats_seconds

@@ -23,62 +23,25 @@
 
 ### 2. 两端怎么调用
 
-以下是两个独立固件的调用示例。`board_*` 是需要对接到板级驱动的函数声明。快照函数填满第 3 节所列输入；发布函数按值复制请求或回执供 1 秒 LoRa 任务取用。控制周期与无线发送周期独立。
+仓库提供两份可独立编译的 C 示例，包含上电初始化、LoRa 接收缓存和 10 ms 控制调用。[机载示例](examples/airborne_example.c) · [车载示例](examples/vehicle_example.c)
 
-**机端** · `airborne_track_init` 清空定位历史。每拍传入历史对象、当前时刻、只读 `AirInput` 和可写 `AirReply`；四个参数中的指针都要指向有效对象。位置速度可由连续定位推算。
+在 STM32 工程中编入对应示例和本端算法源文件，调用处包含 `examples/antenna_examples.h`。上电调用 `*_example_init`，每次收到新的 LoRa 报文后调用 `*_example_receive`，在控制任务中调用 `*_example_tick`。控制任务按 `Command.valid` 决定是否发送云台目标，并把本拍的请求或回执留给每秒一轮的 LoRa 任务。发送时附上本机定位和健康状态。每次接收先完成解码、去重和时间转换。示例的接收函数和控制函数应在同一任务串行调用，跨任务时可由接收任务通过邮箱将报文交给控制任务。
 
-```c
-#include "airborne/airborne.h"
+在项目根目录用 GCC 运行两份独立演示。编译 STM32 固件时无需定义 `ANTENNA_EXAMPLE_DEMO`。
 
-static AirHistory history;
-extern void board_air_snapshot(AirInput *out);
-extern void board_air_publish_reply(AirReply reply);
-extern void board_air_servo_target(double az_deg, double el_deg);
-
-void air_app_init(void)
-{
-    airborne_track_init(&history);
-}
-
-Command air_app_tick_10ms(uint32_t now)
-{
-    AirInput input = {0};
-    AirReply reply;
-    board_air_snapshot(&input);
-    Command cmd = airborne_track_step(&history, now, &input, &reply);
-    board_air_publish_reply(reply);
-    if (cmd.valid)
-        board_air_servo_target(cmd.az_deg, cmd.el_deg);
-    return cmd;
-}
+```powershell
+gcc -std=c99 -Wall -Wextra -Werror -DANTENNA_EXAMPLE_DEMO examples/airborne_example.c airborne/airborne.c common/link.c -lm -o airborne_example.exe
+gcc -std=c99 -Wall -Wextra -Werror -DANTENNA_EXAMPLE_DEMO examples/vehicle_example.c vehicle/vehicle.c common/link.c -lm -o vehicle_example.exe
+.\airborne_example.exe
+.\vehicle_example.exe
 ```
 
-**车端** · `vehicle_init` 加载固件默认参数并准备几何对准。每拍传入控制器对象、当前时刻和只读 `VehicleInput`。调用结束后，读 `scanner.request` 作为下次发给机端的修正请求。
+| 板端 | 上电调用 | LoRa 接收时传入 | 每 10 ms 调用及随包输出 |
+|---|---|---|---|
+| 机载 | `air_example_init()` | `air_example_receive(peer_fix, peer_ok, request, rx_ms)` | `cmd = air_example_tick(now, &local, &reply)`，将 `reply` 留给 LoRa 发送。 |
+| 车载 | `vehicle_example_init(session)` | `vehicle_example_receive(peer_fix, peer_ok, reply, rx_ms)` | `cmd = vehicle_example_tick(now, &local, &request)`，将 `request` 留给 LoRa 发送。 |
 
-```c
-#include "vehicle/vehicle.h"
-
-static Vehicle scanner;
-extern void board_vehicle_snapshot(VehicleInput *out);
-extern void board_vehicle_publish_request(AirRequest request);
-extern void board_vehicle_servo_target(double az_deg, double el_deg);
-
-void vehicle_app_init(void)
-{
-    vehicle_init(&scanner);
-}
-
-Command vehicle_app_tick_10ms(uint32_t now)
-{
-    VehicleInput input = {0};
-    board_vehicle_snapshot(&input);
-    Command cmd = vehicle_step(&scanner, now, &input);
-    board_vehicle_publish_request(scanner.request);
-    if (cmd.valid)
-        board_vehicle_servo_target(cmd.az_deg, cmd.el_deg);
-    return cmd;
-}
-```
+`local` 只需填本机采集的数据。对端位置、状态和请求或回执由接收函数缓存，车端 `session` 由初始化函数保存。字段含义见下一节。
 
 `cmd.valid == false` 时，示例停止下发新目标。伺服保持、停机、故障保护由板级逻辑按设备状态执行。方位跨 0° 时，伺服按最短角差执行，例如从 359° 到 1° 只需正转 2°。
 
@@ -166,6 +129,8 @@ bool apply_receiver_config(Vehicle *scanner, double measured_half_power_deg)
 字段类型可直接查阅 [公共类型](common/link.h)、[机端接口](airborne/airborne.h) 和 [车端接口](vehicle/vehicle.h)。
 
 ## 鼠标交互仿真
+
+点主窗口顶部的「算法输入输出」，选择机载或车载。「初始化」显示初始化函数的参数、返回类型和写入对象的初值；车端还列出上位机启动时覆盖的配置。「跟踪调用（10 ms）」显示最近一次实际 C 调用的仿真时间、本端与对端定位、编码器读数、完整输入结构体，以及返回的云台目标方位、俯仰、状态和有效位。机端页另列到位回执，车端页另列待发修正请求和本拍生效门限。窗口随仿真刷新，可在主窗口暂停后对照两端同一拍的数据。对端定位时间戳按 LoRa 收包周期更新。
 
 在项目根目录启动桌面窗口：
 
