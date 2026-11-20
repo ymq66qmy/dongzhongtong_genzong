@@ -369,6 +369,33 @@ class LockRecoveryTest(unittest.TestCase):
             self.assertTrue(s.aligned_lock)
             self.assertIsNone(s.loss_start_ms)
 
+    def test_clear_statistics_discards_an_outage_in_progress(self):
+        s = self.sim
+        s.flight = FlightTest(0, 0, 90, 15, 42, True)
+        s.drive = DriveTest(0, 0, 90, 15, 73, True, 1, 0, 12)
+        self.wait_for(lambda: s.first_lock_ms is not None, 30)
+        s.blocked = True
+        self.advance(100)
+        s.blocked = False
+        self.wait_for(lambda: len(s.relocks) == 1, 40)
+        s.blocked = True
+        self.advance(100)
+        self.assertIsNotNone(s.loss_start_ms)
+        self.assertEqual((s.flight.losses, s.drive.losses), (2, 2))
+        s.clear_tracking_stats()
+        self.assertEqual((s.flight.losses, s.drive.losses), (0, 0))
+        self.assertFalse(s.relocks)
+        self.advance(50)
+        self.assertIsNone(s.loss_start_ms)
+        s.blocked = False
+        self.wait_for(lambda: s.counting_losses, 40)
+        self.assertFalse(s.relocks)
+        s.blocked = True
+        self.advance(100)
+        s.blocked = False
+        self.wait_for(lambda: len(s.relocks) == 1, 40)
+        self.assertEqual((s.flight.losses, s.drive.losses), (1, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

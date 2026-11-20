@@ -367,6 +367,13 @@ class Simulation:
     def clear_tracking_stats(self):
         self.tracking_stats_start_ms = self.ms
         self.effective_tracking_ticks = 0
+        # An outage that started before the reset belongs to the previous interval.
+        self.counting_losses = bool(self.out.holding and self.loss_start_ms is None)
+        self.loss_start_ms = None
+        self.relocks.clear()
+        for run in (self.flight, self.drive):
+            if run is not None:
+                run.losses = 0
 
     def call_snapshot(self):
         snapshot = CallSnapshot()
@@ -480,14 +487,15 @@ class Simulation:
                 run.losses+=int(bool(prev.holding) and not self.out.holding)
         # Timing follows controller loss declarations, including loss during a
         # periodic calibration. Only a verified return to TRACK closes an outage.
-        if self.first_lock_ms is not None and not self.out.holding and self.loss_start_ms is None:
+        if self.counting_losses and not self.out.holding and self.loss_start_ms is None:
             self.loss_start_ms = self.ms
         if effective_tracking:
             if self.first_lock_ms is None:
                 self.first_lock_ms = self.ms
-            elif self.loss_start_ms is not None:
+            if self.loss_start_ms is not None:
                 self.relocks.append((self.loss_start_ms, self.ms))
                 self.loss_start_ms = None
+            self.counting_losses = True
         # Capture transitions on controller ticks, even between two GUI refreshes.
         modes = (self.out.phase if self.out.ground.valid else self.out.ground.mode,
                  self.out.air.mode, self.out.ground.mode)

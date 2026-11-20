@@ -21,6 +21,18 @@ FIELDS = (("lat","纬度 °"), ("lon","经度 °"), ("height","高度 m"), ("hea
           ("az","实测方位 °"), ("el","实测俯仰 °"))
 
 
+def format_duration(seconds, precision):
+    raw_seconds = f"{seconds:.{precision}f}"
+    whole, dot, fraction = raw_seconds.partition(".")
+    days, time_of_day = divmod(int(whole), 86400)
+    years, days = divmod(days, 365)
+    months, days = divmod(days, 30)
+    hours, time_of_day = divmod(time_of_day, 3600)
+    minutes, whole_seconds = divmod(time_of_day, 60)
+    return (f"{raw_seconds} s（{years}年{months}月{days}日"
+            f"{hours}时{minutes}分{whole_seconds}{dot}{fraction}秒）")
+
+
 def beam_footprint(x, y, radius, az, el):
     """Convex outline of the finite 3D main lobe projected onto the map."""
     half = math.radians(BEAM_HALF_DEG)
@@ -211,6 +223,8 @@ class Workbench:
         ttk.Button(tracking_bar, text="清空统计", command=self.clear_tracking_stats).pack(side="right")
         self.tracking_status = ttk.Label(tracking_bar)
         self.tracking_status.pack(side="left", fill="x", expand=True)
+        self.tracking_status.bind(
+            "<Configure>", lambda e: self.tracking_status.configure(wraplength=max(60, e.width - 4)))
         flight_bar=ttk.Frame(right)
         flight_bar.pack(fill="x",padx=8)
         ttk.Button(flight_bar,text="连续飞行测试",command=self.configure_flight).pack(side="left")
@@ -400,6 +414,8 @@ class Workbench:
 
     def clear_tracking_stats(self):
         self.sim.clear_tracking_stats()
+        self.history.delete(0, "end")
+        self.history_count = 0
         self.refresh()
 
     def stop_flight(self, ground=False):
@@ -745,14 +761,17 @@ class Workbench:
         effective, elapsed = s.tracking_stats_seconds
         percentage = f"{effective / elapsed:.2%}" if elapsed else "—"
         self.tracking_status.configure(
-            text=f"有效跟踪占比 {percentage}　有效 {effective:.2f} s / 总计 {elapsed:.2f} s")
+            text=(f"有效跟踪占比 {percentage}　有效 {format_duration(effective, 2)}"
+                  f" / 总计 {format_duration(elapsed, 2)}"))
         flight=s.flight
         self.stop_flight_btn.configure(state="normal" if flight and flight.active else "disabled")
         summary=""
         if flight:
             status="已停止" if not flight.active else "等待锁定" if flight.waiting else "边界折返" if flight.returning else "飞行中"
-            summary=(f"{status}  {flight.ticks*DT:.1f} s　{flight.actual_speed if flight.active else 0:.1f} m/s　航迹 {flight.course:.0f}°"
-                     f"　有效跟踪 {flight.track_ticks*DT:.1f} s　失锁 {flight.losses}　回几何 {flight.near_returns}")
+            summary=(f"{status}  {format_duration(flight.ticks * DT, 1)}"
+                     f"　{flight.actual_speed if flight.active else 0:.1f} m/s　航迹 {flight.course:.0f}°"
+                     f"\n有效跟踪 {format_duration(flight.track_ticks * DT, 1)}"
+                     f"　失锁 {flight.losses}　回几何 {flight.near_returns}")
             if MODES[o.phase]=="TRACK":
                 summary+=f"\n车端峰心　方位 {o.center_az:.2f}°　仰角 {o.center_el:.2f}°"
         self.flight_status.configure(text=summary+(f"　{flight.stop_reason}" if flight and flight.stop_reason else ""))
@@ -761,10 +780,11 @@ class Workbench:
         summary=""
         if drive:
             status="已停车" if not drive.active else "等待锁定" if drive.waiting else "边界折返" if drive.returning else "行车中"
-            summary=(f"{status}  {drive.ticks*DT:.1f} s　{drive.actual_speed if drive.active else 0:.1f} m/s"
+            summary=(f"{status}  {format_duration(drive.ticks * DT, 1)}　{drive.actual_speed if drive.active else 0:.1f} m/s"
                      f"　车头 {s.ground.heading:.1f}°　纵倾 {s.axes[1].body_pitch:+.2f}°"
                      f"　侧倾 {s.axes[1].body_roll:+.2f}°　起伏 {drive.heave:+.2f} m"
-                     f"\n有效跟踪 {drive.track_ticks*DT:.1f} s　失锁 {drive.losses}　回几何 {drive.near_returns}")
+                     f"\n有效跟踪 {format_duration(drive.track_ticks * DT, 1)}"
+                     f"　失锁 {drive.losses}　回几何 {drive.near_returns}")
         self.drive_status.configure(text=summary+(f"　{drive.stop_reason}" if drive and drive.stop_reason else ""))
         if self.auto_fit and self.drag is None and any(r and r.active for r in (flight,drive)):
             if (any(not (15<x<self.map_width()-15 and 15<y<self.map_height()-15)
@@ -822,6 +842,8 @@ class Workbench:
         elif s.relocks:
             start,end=s.relocks[-1]
             timer_text=f"第 {len(s.relocks)} 次重锁　用时 {(end-start)/1000:.2f} s"
+        elif not s.counting_losses and s.first_lock_ms is not None:
+            timer_text="失锁重锁统计已清空　恢复锁定后重新计数"
         elif s.first_lock_ms is not None:
             timer_text=f"首次锁定 {s.first_lock_ms/1000:.2f} s　尚无失锁记录"
         else:

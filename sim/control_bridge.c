@@ -36,7 +36,8 @@ typedef struct {
     Target air_target, ground_target;
     AirReply reply;
     AirRequest request;
-    int phase_after, holding;
+    int phase_after, holding, ack;
+    double air_arrival_deg;
 } CallSnapshot;
 
 typedef struct {
@@ -60,6 +61,7 @@ API Control *control_new(void) {
     c->calls.initial_config=c->scanner.cfg;
     c->calls.initial_phase=c->scanner.mode;
     c->calls.initial_request=c->scanner.request;
+    c->calls.air_arrival_deg=AIR_ARRIVAL_DEG;
     c->scanner.cfg.fast_relock=true;
     c->scanner.cfg.fast_acquire=true;
     c->scanner.cfg.recover_radius_points=1;
@@ -189,6 +191,7 @@ API void control_step(Control *c, uint32_t now, const Pose *air, const Pose *gro
     out->settling=v->settling;
     out->ack=c->ground.air.arrived && c->ground.air.session==v->request.session &&
              c->ground.air.point==v->request.point && now-c->ground.air_rx_ms<=COORD_MAX_AGE_MS;
+    calls->ack=out->ack;
     out->confirm=v->confirm_lock;
     out->rx_probe=v->ground_refresh && v->mode==CAL_AIR;
     out->holding=v->monitoring_lock;

@@ -152,7 +152,8 @@ class CallSnapshot(C.Structure):
         (Target, "air_target ground_target"),
         (AirReply, "reply"),
         (AirRequest, "request"),
-        (C.c_int, "phase_after holding"),
+        (C.c_int, "phase_after holding ack"),
+        (D, "air_arrival_deg"),
     )
 
 
@@ -168,6 +169,63 @@ def field_lines(structure, prefix):
             elif isinstance(value, float):
                 value = f"{value:.10g}"
             yield f"{path} = {value}"
+
+
+def request_line(label, request):
+    if not request.session:
+        return f"{label}    无有效请求编号"
+    return (f"{label}    会话 {request.session} / 请求 {request.point}\n"
+            f"    地理方位修正 {request.az_trim:+.3f}°   地理仰角修正 {request.el_trim:+.3f}°")
+
+
+def angle_line(label, az, el, valid):
+    if not valid:
+        return f"{label}    无效"
+    return f"{label}    方位 {az:.4f}°   俯仰 {el:.4f}°"
+
+
+def coordination_lines(s, modes):
+    received = s.ground.air
+    actual = s.air.link.actual
+    target = s.air_target
+    lines = [
+        "控制阶段与本车云台",
+        f"控制阶段    {modes[s.phase_before]} → {modes[s.phase_after]}（调用前 → 调用后）",
+        f"车载输出状态    {modes[s.ground_target.mode]}",
+        angle_line("车载目标角", s.ground_target.az, s.ground_target.el, s.ground_target.valid),
+        angle_line("车载实测角", s.ground.link.actual.az_deg, s.ground.link.actual.el_deg,
+                   s.ground.link.actual.valid),
+        "",
+        "车机 LoRa 协调",
+        request_line("车端待发修正", s.request),
+    ]
+    if received.session:
+        age = (s.now - s.ground.air_rx_ms) & 0xFFFFFFFF
+        status = "已到位" if received.arrived else "未到位"
+        lines.append(f"车端收到的回执    会话 {received.session} / 请求 {received.point} · {status} · 包龄 {age} ms")
+    else:
+        lines.append("车端收到的回执    暂无有效回执")
+    ack = "已有匹配的到位回执" if s.ack else "等待匹配的到位回执"
+    if s.request.session:
+        lines.append(f"车端当前请求    {ack}")
+    lines.extend([
+        "",
+        "同拍机端数据（仅仿真可见）",
+        request_line("机端收到的修正", s.air.request),
+        "机端根据地理视线加上修正量，再换算成机载云台目标角。",
+        angle_line("机载目标角", target.az, target.el, target.valid),
+        angle_line("机载实测角", actual.az_deg, actual.el_deg, actual.valid),
+    ])
+    if target.valid and actual.valid:
+        az_error = abs((target.az - actual.az_deg + 180) % 360 - 180)
+        el_error = abs(target.el - actual.el_deg)
+        lines.append(f"机载误差    方位 {az_error:.4f}°   俯仰 {el_error:.4f}°   到位容差 ±{s.air_arrival_deg:g}°/轴")
+    if s.reply.session:
+        status = "已到位" if s.reply.arrived else "未到位"
+        lines.append(f"机端本拍生成的回执    会话 {s.reply.session} / 请求 {s.reply.point} · {status}")
+    else:
+        lines.append("机端本拍生成的回执    暂无有效回执")
+    return lines
 
 
 def call_text(snapshot, airborne, initialization, modes):
@@ -191,7 +249,10 @@ def call_text(snapshot, airborne, initialization, modes):
         link = incoming.link
         signature = ("airborne_track_step(&history, now, &input, &reply)" if airborne else
                      "vehicle_step(&scanner, now, &input)")
-        lines = ["cmd = " + signature, f"now = {s.now} ms", "", "本拍输入"]
+        lines = ["cmd = " + signature, f"now = {s.now} ms", ""]
+        if not airborne:
+            lines.extend([*coordination_lines(s, modes), ""])
+        lines.append("本拍输入")
         for title, fix in (("本端定位", link.local), ("对端 LoRa 定位", link.peer)):
             lines.append(f"{title}    纬 {fix.lat_deg:.7f}°   经 {fix.lon_deg:.7f}°   高 {fix.height_m:.2f} m"
                          f"    采样 {fix.stamp_ms} ms" + ("" if fix.valid else "（无效）"))
